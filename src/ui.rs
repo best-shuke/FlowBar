@@ -74,7 +74,8 @@ struct Ui {
     run: Option<Arc<Run>>,
     log: Option<PathBuf>,
     status_item: Option<Retained<NSStatusItem>>,
-    menu: Option<Retained<NSMenu>>,
+    /// The 策略组与节点 submenu and the groups it was built from.
+    groups_menu: Option<(Retained<NSMenu>, Vec<Group>)>,
     window: Option<Window>,
     refreshing: bool,
     operation: bool,
@@ -90,7 +91,7 @@ impl Default for Ui {
             run: None,
             log: None,
             status_item: None,
-            menu: None,
+            groups_menu: None,
             window: None,
             refreshing: false,
             operation: false,
@@ -125,6 +126,8 @@ define_class!(
         fn reopen(&self, _application: &NSApplication, _visible: bool) -> bool { self.show_settings(); true }
     }
     unsafe impl NSMenuDelegate for Delegate {
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn needs_update(&self, menu: &NSMenu) { self.fill_menu(menu); }
         #[unsafe(method(menuWillOpen:))]
         fn will_open(&self, _menu: &NSMenu) { self.refresh_groups(); }
     }
@@ -175,6 +178,11 @@ define_class!(
 impl Delegate {
     fn setup(&self) {
         let item = NSStatusBar::systemStatusBar().statusItemWithLength(24.0);
+        // Items are built in menuNeedsUpdate:, so an open menu is never rebuilt under the cursor.
+        let menu = NSMenu::new(self.mtm());
+        menu.setAutoenablesItems(false);
+        menu.setDelegate(Some(ProtocolObject::from_ref(self)));
+        item.setMenu(Some(&menu));
         self.ivars().ui.borrow_mut().status_item = Some(item);
         unsafe {
             NSDistributedNotificationCenter::defaultCenter().addObserver_selector_name_object(
@@ -231,7 +239,6 @@ impl Delegate {
         let ui = self.ivars().ui.borrow();
         let mtm = self.mtm();
         let busy = matches!(ui.phase, Phase::Starting | Phase::Stopping);
-        let enabled = !busy && !ui.operation;
         if let Some(button) = ui.status_item.as_ref().and_then(|item| item.button(mtm)) {
             let symbol = if ui.phase == Phase::Running {
                 "paperplane.fill"
@@ -253,117 +260,9 @@ impl Delegate {
                 ui.message
             ))));
         }
-        let created = ui.menu.is_none();
-        let menu = ui.menu.clone().unwrap_or_else(|| {
-            let menu = NSMenu::new(mtm);
-            menu.setAutoenablesItems(false);
-            menu.setDelegate(Some(ProtocolObject::from_ref(self)));
-            menu
-        });
-        // Rebuild in place: replacing the status item's menu while it is open leaves the
-        // displayed copy stale (groups refreshed in menuWillOpen never appeared).
-        menu.removeAllItems();
-        menu.addItem(&self.item(&format!("FlowBar · {}", ui.message), None, false, false));
-        menu.addItem(&self.item(&ui.settings.profile_name, None, false, false));
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
-        menu.addItem(&self.item(
-            if ui.phase == Phase::Running {
-                "停止连接"
-            } else {
-                "启动连接"
-            },
-            Some(Action::Connect),
-            enabled,
-            false,
-        ));
-        let modes = NSMenu::new(mtm);
-        modes.setAutoenablesItems(false);
-        for (title, mode) in [
-            ("规则分流", "rule"),
-            ("全局代理", "global"),
-            ("全部直连", "direct"),
-        ] {
-            modes.addItem(&self.item(
-                title,
-                Some(Action::Mode(mode.into())),
-                enabled,
-                ui.settings.mode == mode,
-            ));
-        }
-        let parent = self.item("分流模式", None, true, false);
-        parent.setSubmenu(Some(&modes));
-        menu.addItem(&parent);
-        if !ui.groups.is_empty() {
-            let groups = NSMenu::new(mtm);
-            groups.setAutoenablesItems(false);
-            for group in &ui.groups {
-                let choices = NSMenu::new(mtm);
-                choices.setAutoenablesItems(false);
-                for choice in &group.choices {
-                    choices.addItem(&self.item(
-                        choice,
-                        Some(Action::Select(group.name.clone(), choice.clone())),
-                        enabled && group.kind.eq_ignore_ascii_case("selector"),
-                        &group.current == choice,
-                    ));
-                }
-                let item = self.item(
-                    &format!("{} → {}", group.name, group.current),
-                    None,
-                    true,
-                    false,
-                );
-                item.setSubmenu(Some(&choices));
-                groups.addItem(&item);
-            }
-            let parent = self.item("策略组与节点", None, true, false);
-            parent.setSubmenu(Some(&groups));
-            menu.addItem(&parent);
-        }
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
-        let stopped = matches!(ui.phase, Phase::Stopped | Phase::Failed);
-        menu.addItem(&self.item("使用 TUN", Some(Action::Tun), stopped, ui.settings.tun));
-        menu.addItem(&self.item(
-            "打开后自动连接",
-            Some(Action::Auto),
-            true,
-            ui.settings.auto_connect,
-        ));
-        let login = login_status();
-        let login_title = if login == SMAppServiceStatus::RequiresApproval {
-            "登录时打开（等待系统批准）"
-        } else {
-            "登录时打开 FlowBar"
-        };
-        menu.addItem(&self.item(
-            login_title,
-            Some(Action::Login),
-            true,
-            login == SMAppServiceStatus::Enabled,
-        ));
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
-        for (title, action, enabled) in [
-            ("设置…", Action::Settings, true),
-            ("导入 YAML…", Action::Import, stopped),
-            (
-                "打开运行日志",
-                Action::Logs,
-                ui.run.is_some() || ui.log.is_some(),
-            ),
-            ("打开数据目录", Action::Data, true),
-        ] {
-            menu.addItem(&self.item(title, Some(action), enabled, false));
-        }
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
-        let quit = self.item("退出 FlowBar", Some(Action::Quit), true, false);
-        quit.setKeyEquivalent(&NSString::from_str("q"));
-        menu.addItem(&quit);
-        if created {
-            if let Some(item) = &ui.status_item {
-                item.setMenu(Some(&menu));
-            }
-        }
         if let Some(window) = &ui.window {
+            let stopped = matches!(ui.phase, Phase::Stopped | Phase::Failed);
+            let login = login_status();
             let metadata = fs::read_to_string(config::home().join("profile.yaml"))
                 .ok()
                 .and_then(|s| config::summary(&s).ok());
@@ -425,8 +324,146 @@ impl Delegate {
             window.start.setEnabled(!busy);
             window.import.setEnabled(stopped);
         }
+    }
+    /// Called by menuNeedsUpdate: just before the status menu opens.
+    fn fill_menu(&self, menu: &NSMenu) {
+        let ui = self.ivars().ui.borrow();
+        let mtm = self.mtm();
+        let busy = matches!(ui.phase, Phase::Starting | Phase::Stopping);
+        let enabled = !busy && !ui.operation;
+        menu.removeAllItems();
+        menu.addItem(&self.item(&format!("FlowBar · {}", ui.message), None, false, false));
+        menu.addItem(&self.item(&ui.settings.profile_name, None, false, false));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&self.item(
+            if ui.phase == Phase::Running {
+                "停止连接"
+            } else {
+                "启动连接"
+            },
+            Some(Action::Connect),
+            enabled,
+            false,
+        ));
+        let modes = NSMenu::new(mtm);
+        modes.setAutoenablesItems(false);
+        for (title, mode) in [
+            ("规则分流", "rule"),
+            ("全局代理", "global"),
+            ("全部直连", "direct"),
+        ] {
+            modes.addItem(&self.item(
+                title,
+                Some(Action::Mode(mode.into())),
+                enabled,
+                ui.settings.mode == mode,
+            ));
+        }
+        let parent = self.item("分流模式", None, true, false);
+        parent.setSubmenu(Some(&modes));
+        menu.addItem(&parent);
+        let mut groups_menu = None;
+        if !ui.groups.is_empty() {
+            let groups = NSMenu::new(mtm);
+            groups.setAutoenablesItems(false);
+            self.fill_groups(&groups, &ui.groups, enabled);
+            let parent = self.item("策略组与节点", None, true, false);
+            parent.setSubmenu(Some(&groups));
+            menu.addItem(&parent);
+            groups_menu = Some((groups, ui.groups.clone()));
+        }
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let stopped = matches!(ui.phase, Phase::Stopped | Phase::Failed);
+        menu.addItem(&self.item("使用 TUN", Some(Action::Tun), stopped, ui.settings.tun));
+        menu.addItem(&self.item(
+            "打开后自动连接",
+            Some(Action::Auto),
+            true,
+            ui.settings.auto_connect,
+        ));
+        let login = login_status();
+        let login_title = if login == SMAppServiceStatus::RequiresApproval {
+            "登录时打开（等待系统批准）"
+        } else {
+            "登录时打开 FlowBar"
+        };
+        menu.addItem(&self.item(
+            login_title,
+            Some(Action::Login),
+            true,
+            login == SMAppServiceStatus::Enabled,
+        ));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        for (title, action, enabled) in [
+            ("设置…", Action::Settings, true),
+            ("导入 YAML…", Action::Import, stopped),
+            (
+                "打开运行日志",
+                Action::Logs,
+                ui.run.is_some() || ui.log.is_some(),
+            ),
+            ("打开数据目录", Action::Data, true),
+        ] {
+            menu.addItem(&self.item(title, Some(action), enabled, false));
+        }
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let quit = self.item("退出 FlowBar", Some(Action::Quit), true, false);
+        quit.setKeyEquivalent(&NSString::from_str("q"));
+        menu.addItem(&quit);
         drop(ui);
-        self.ivars().ui.borrow_mut().menu = Some(menu);
+        self.ivars().ui.borrow_mut().groups_menu = groups_menu;
+    }
+    fn fill_groups(&self, menu: &NSMenu, groups: &[Group], enabled: bool) {
+        menu.removeAllItems();
+        for group in groups {
+            let choices = NSMenu::new(self.mtm());
+            choices.setAutoenablesItems(false);
+            for choice in &group.choices {
+                choices.addItem(&self.item(
+                    choice,
+                    Some(Action::Select(group.name.clone(), choice.clone())),
+                    enabled && group.kind.eq_ignore_ascii_case("selector"),
+                    &group.current == choice,
+                ));
+            }
+            let item = self.item(&group_title(group), None, true, false);
+            item.setSubmenu(Some(&choices));
+            menu.addItem(&item);
+        }
+    }
+    /// Shows groups fetched after the menu opened. Groups with the same names and choices
+    /// are updated in place, so a submenu the user is browsing stays open.
+    fn update_groups(&self) {
+        let mut ui = self.ivars().ui.borrow_mut();
+        let enabled = !matches!(ui.phase, Phase::Starting | Phase::Stopping) && !ui.operation;
+        let groups = ui.groups.clone();
+        let Some((menu, shown)) = ui.groups_menu.as_mut() else {
+            return;
+        };
+        let same_shape = shown.len() == groups.len()
+            && shown.iter().zip(&groups).all(|(old, new)| {
+                old.name == new.name && old.kind == new.kind && old.choices == new.choices
+            });
+        if !same_shape {
+            self.fill_groups(menu, &groups, enabled);
+        } else {
+            for (index, group) in groups.iter().enumerate() {
+                let Some(item) = menu.itemAtIndex(index as isize) else {
+                    continue;
+                };
+                item.setTitle(&NSString::from_str(&group_title(group)));
+                let Some(choices) = item.submenu() else {
+                    continue;
+                };
+                for (position, choice) in group.choices.iter().enumerate() {
+                    if let Some(entry) = choices.itemAtIndex(position as isize) {
+                        entry.setEnabled(enabled && group.kind.eq_ignore_ascii_case("selector"));
+                        entry.setState(i64::from(&group.current == choice) as _);
+                    }
+                }
+            }
+        }
+        *shown = groups;
     }
     fn item(
         &self,
@@ -576,6 +613,7 @@ impl Delegate {
     fn drain(&self) {
         let events: Vec<_> = self.ivars().receiver.try_iter().collect();
         let mut changed = false;
+        let mut groups_changed = false;
         let mut errors = vec![];
         for event in events {
             let current = self.ivars().ui.borrow().run.as_ref().map(|r| r.id.clone());
@@ -617,10 +655,11 @@ impl Delegate {
                     }
                     Event::Groups(id, groups) if current.as_deref() == Some(&id) => {
                         ui.refreshing = false;
-                        // Rebuilding an open menu closes its submenus; skip it when nothing changed.
-                        handled = !groups.is_empty() && groups != ui.groups;
-                        if handled {
+                        // Only the menu shows groups; it may already be open.
+                        handled = false;
+                        if !groups.is_empty() && groups != ui.groups {
                             ui.groups = groups;
+                            groups_changed = true;
                         }
                     }
                     Event::Mode(id, mode) if current.as_deref() == Some(&id) => {
@@ -648,6 +687,9 @@ impl Delegate {
         }
         if changed {
             self.render();
+        }
+        if groups_changed {
+            self.update_groups();
         }
         // Alerts run a modal loop that can re-enter drain; showing them mid-batch would
         // apply this batch's older events after newer ones.
@@ -983,6 +1025,9 @@ impl Delegate {
     }
 }
 
+fn group_title(group: &Group) -> String {
+    format!("{} → {}", group.name, group.current)
+}
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
 }

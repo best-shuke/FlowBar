@@ -55,6 +55,8 @@ impl Run {
     }
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        // Quit exits right after cancelling, before the worker thread can clean up.
+        self.remove_config();
         let _ = config::private_write(&self.stage.join("stop"), &[]);
         let pid = self.command_pid.load(Ordering::SeqCst);
         if pid > 1 {
@@ -62,6 +64,20 @@ impl Run {
                 libc::kill(pid, libc::SIGTERM);
             }
         }
+    }
+    /// The runtime copy holds node credentials and the controller secret.
+    fn remove_config(&self) {
+        let _ = fs::remove_file(self.stage.join("config.yaml"));
+    }
+    /// Runs off the main thread: the first prune after an upgrade can delete many sessions.
+    fn prune(&self) {
+        let uid = unsafe { libc::getuid() };
+        let sessions = self.stage.parent().unwrap();
+        config::prune_sessions(sessions, |id| {
+            id == self.id
+                || supervisor::running(&sessions.join(id))
+                || supervisor::running(&supervisor::root_session(uid, id))
+        });
     }
     pub fn group_order(&self) -> Vec<String> {
         fs::read_to_string(config::home().join("profile.yaml"))
@@ -73,17 +89,11 @@ impl Run {
 }
 pub fn start(settings: Settings, emit: Emit) -> Result<Arc<Run>> {
     settings.validate()?;
-    let uid = unsafe { libc::getuid() };
-    let sessions = config::home().join("Sessions");
-    config::prune_sessions(&sessions, |id| {
-        supervisor::running(&sessions.join(id))
-            || supervisor::running(&supervisor::root_session(uid, id))
-    });
     let id = Uuid::new_v4().to_string();
-    let stage = sessions.join(&id);
+    let stage = config::home().join("Sessions").join(&id);
     config::private_dir(&stage)?;
     let status_path = if settings.tun {
-        supervisor::root_session(uid, &id)
+        supervisor::root_session(unsafe { libc::getuid() }, &id)
     } else {
         stage.clone()
     };
@@ -102,9 +112,9 @@ pub fn start(settings: Settings, emit: Emit) -> Result<Arc<Run>> {
     });
     let background = run.clone();
     thread::spawn(move || {
+        background.prune();
         let outcome = worker(&background, &emit);
-        // The runtime copy holds node credentials and the controller secret.
-        let _ = fs::remove_file(background.stage.join("config.yaml"));
+        background.remove_config();
         match outcome {
             Ok(()) => emit(Event::Stopped(background.id.clone())),
             Err(_)
@@ -243,6 +253,8 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
         ensure!(Instant::now() < deadline, "内核启动超时，请查看日志。");
         thread::sleep(Duration::from_millis(100));
     }
+    // Both supervisors read the stage copy before reporting running.
+    run.remove_config();
     for (group, choice) in &run.settings.selections {
         let _ = run.api.select(group, choice);
     }

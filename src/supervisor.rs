@@ -10,12 +10,15 @@ use core_foundation::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    ffi::{CStr, c_void},
+    ffi::{CStr, OsStr, c_void},
     fs,
     io::{self, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        },
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -51,13 +54,19 @@ pub fn read_status(path: &Path) -> Option<Status> {
 }
 /// A session still owns its directories while its core process is alive.
 pub fn running(path: &Path) -> bool {
-    read_status(path).is_some_and(|s| {
-        s.state == "running"
-            && s.core_pid.is_some_and(|pid| {
-                let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-                alive || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-            })
-    })
+    read_status(path).is_some_and(|s| s.state == "running" && s.core_pid.is_some_and(is_core))
+}
+/// After a crash or reboot the recorded PID can belong to any process, so it must still be a mihomo.
+fn is_core(pid: u32) -> bool {
+    let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length =
+        unsafe { libc::proc_pidpath(pid as i32, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if length <= 0 {
+        // Keep the session if the process exists but its path is hidden from us.
+        return io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    }
+    Path::new(OsStr::from_bytes(&buffer[..length as usize])).file_name()
+        == Some(OsStr::new("mihomo"))
 }
 pub fn resources() -> Result<PathBuf> {
     let executable = std::env::current_exe()?;
@@ -289,6 +298,8 @@ fn run_core(
                 thread::sleep(Duration::from_millis(100));
             }
             ensure!(ready, "内核启动超时，请检查端口或配置。");
+            // mihomo has loaded the config; drop the copy holding credentials and the secret.
+            let _ = fs::remove_file(config_file);
             if tun {
                 dns = Some(SessionDns::new(
                     session.file_name().unwrap().to_str().unwrap(),
@@ -363,11 +374,14 @@ fn copy_data(source: &Path, destination: &Path, owner: u32) -> Result<()> {
             root_directory(&target, 0o700)?;
             copy_data(&path, &target, owner)?;
         } else {
-            // Files the root core updated itself (providers, cache) are newer; keep them.
+            // The status change time moves whenever a file is written or replaced, even when
+            // its mtime is preserved or set back. Keep a root copy written after the source
+            // last changed: either our copy or the root core's own refresh of it.
             let unchanged = fs::symlink_metadata(&target).ok().is_some_and(|dest| {
                 dest.is_file()
                     && dest.uid() == 0
-                    && metadata.modified().ok() <= dest.modified().ok()
+                    && (metadata.ctime(), metadata.ctime_nsec())
+                        <= (dest.ctime(), dest.ctime_nsec())
             });
             if !unchanged {
                 copy_regular(&path, &target, Some(owner))?;

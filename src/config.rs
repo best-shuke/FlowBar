@@ -116,9 +116,11 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     result
 }
 
-/// Removes ended session directories beyond the most recent few; `active` protects live ones.
+/// Runs as a session starts; `active` protects live sessions, including the new one.
+/// Ended sessions lose any runtime config left by a quit or crash, and only the newest
+/// four are kept, so at most five remain once the new session ends.
 pub fn prune_sessions(sessions: &Path, active: impl Fn(&str) -> bool) {
-    const KEEP: usize = 5;
+    const KEEP: usize = 4;
     let Ok(entries) = fs::read_dir(sessions) else {
         return;
     };
@@ -132,8 +134,12 @@ pub fn prune_sessions(sessions: &Path, active: impl Fn(&str) -> bool) {
         })
         .collect();
     ended.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, path) in ended.into_iter().skip(KEEP) {
-        let _ = fs::remove_dir_all(path);
+    for (index, (_, path)) in ended.into_iter().enumerate() {
+        if index < KEEP {
+            let _ = fs::remove_file(path.join("config.yaml"));
+        } else {
+            let _ = fs::remove_dir_all(path);
+        }
     }
 }
 
@@ -212,6 +218,11 @@ pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> 
     ] {
         map.remove(name);
     }
+    // Inbound servers use these suffixes (tuic-server, ss-config…); drop ones not listed above.
+    map.retain(|key, _| {
+        key.as_str()
+            .is_none_or(|key| !key.ends_with("-server") && !key.ends_with("-config"))
+    });
     set(map, "mixed-port", settings.proxy_port);
     for name in ["port", "socks-port", "redir-port", "tproxy-port"] {
         set(map, name, 0);
@@ -296,7 +307,12 @@ pub fn copy_providers(yaml: &str, source: &Path, destination: &Path) -> Result<(
             );
             let target = destination.join(relative);
             private_dir(target.parent().unwrap())?;
-            private_write(&target, &fs::read(origin)?)?;
+            private_write(&target, &fs::read(&origin)?)?;
+            // Keep the cache age so mihomo refreshes the provider on its real schedule.
+            fs::File::options()
+                .write(true)
+                .open(&target)?
+                .set_modified(fs::metadata(&origin)?.modified()?)?;
         }
     }
     Ok(())
@@ -366,9 +382,15 @@ mod tests {
     }
     #[test]
     fn drops_extra_inbounds_and_accepts_empty_sections() {
-        let yaml = "proxies: []\ntunnels: [tcp/udp,0.0.0.0:6553,1.1.1.1:53,DIRECT]\nss-config: ss://aes-128-gcm:pw@:8388\ntuic-server: {enable: true, listen: 0.0.0.0:443}\ntun:\ndns:\n";
+        let yaml = "proxies: []\ntunnels: [tcp/udp,0.0.0.0:6553,1.1.1.1:53,DIRECT]\nss-config: ss://aes-128-gcm:pw@:8388\ntuic-server: {enable: true, listen: 0.0.0.0:443}\nfuture-server: {listen: 0.0.0.0:8443}\ntrojan-config: trojan://pw@:8444\ntun:\ndns:\n";
         let root = parse(&runtime(yaml, &Settings::default(), "secret").unwrap()).unwrap();
-        for name in ["tunnels", "ss-config", "tuic-server"] {
+        for name in [
+            "tunnels",
+            "ss-config",
+            "tuic-server",
+            "future-server",
+            "trojan-config",
+        ] {
             assert!(root.get(name).is_none(), "{name} must not be kept");
         }
         assert_eq!(root["tun"]["enable"].as_bool(), Some(true));
@@ -381,6 +403,7 @@ mod tests {
         for (index, id) in ids.iter().enumerate() {
             let path = temporary.path().join(id);
             fs::create_dir(&path).unwrap();
+            fs::write(path.join("config.yaml"), "secret: x").unwrap();
             let time = std::time::SystemTime::UNIX_EPOCH
                 + std::time::Duration::from_secs(index as u64 * 60);
             fs::File::open(&path).unwrap().set_modified(time).unwrap();
@@ -388,9 +411,10 @@ mod tests {
         fs::create_dir(temporary.path().join("not-a-session")).unwrap();
         prune_sessions(temporary.path(), |id| id == ids[0]);
         let exists = |id: &str| temporary.path().join(id).exists();
-        assert!(exists(&ids[0]) && exists("not-a-session"));
-        assert!(ids[1..3].iter().all(|id| !exists(id)));
-        assert!(ids[3..].iter().all(|id| exists(id)));
+        let config = |id: &str| temporary.path().join(id).join("config.yaml").exists();
+        assert!(exists(&ids[0]) && config(&ids[0]) && exists("not-a-session"));
+        assert!(ids[1..4].iter().all(|id| !exists(id)));
+        assert!(ids[4..].iter().all(|id| exists(id) && !config(id)));
     }
     #[test]
     fn rejects_duplicates_incomplete_yaml_and_bad_ports() {
@@ -422,10 +446,18 @@ mod tests {
         private_dir(&source.join("rules")).unwrap();
         private_dir(&target).unwrap();
         fs::write(source.join("rules/test.yaml"), "payload: [example.com]").unwrap();
+        let age = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(86400);
+        fs::File::options()
+            .write(true)
+            .open(source.join("rules/test.yaml"))
+            .unwrap()
+            .set_modified(age)
+            .unwrap();
         let yaml =
             "proxies: []\nrule-providers:\n  local:\n    type: file\n    path: ./rules/test.yaml\n";
         copy_providers(yaml, &source, &target).unwrap();
-        assert!(target.join("rules/test.yaml").is_file());
+        let copied = fs::metadata(target.join("rules/test.yaml")).unwrap();
+        assert!(copied.is_file() && copied.modified().unwrap() == age);
         assert!(copy_providers(&yaml.replace("./rules/", "../"), &source, &target).is_err());
         std::os::unix::fs::symlink(source.join("rules/test.yaml"), source.join("link.yaml"))
             .unwrap();
