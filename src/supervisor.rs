@@ -49,6 +49,16 @@ pub fn status(path: &Path, state: &str, pid: Option<u32>) -> Result<()> {
 pub fn read_status(path: &Path) -> Option<Status> {
     serde_json::from_slice(&fs::read(path.join("status.json")).ok()?).ok()
 }
+/// A session still owns its directories while its core process is alive.
+pub fn running(path: &Path) -> bool {
+    read_status(path).is_some_and(|s| {
+        s.state == "running"
+            && s.core_pid.is_some_and(|pid| {
+                let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+                alive || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            })
+    })
+}
 pub fn resources() -> Result<PathBuf> {
     let executable = std::env::current_exe()?;
     Ok(executable
@@ -139,6 +149,10 @@ pub fn root_launch(parent: i32, uid: u32, id: &str) -> Result<()> {
 
 pub fn root_main(parent: i32, uid: u32, id: &str) -> Result<()> {
     let (user_data, session, cache) = root_paths(uid, id)?;
+    let sessions = session.parent().unwrap();
+    config::prune_sessions(sessions, |other| {
+        other == id || running(&sessions.join(other))
+    });
     let stage = user_data.join("Sessions").join(id);
     let mut log = root_log(&session, "core.log", uid)?;
     let core = session.join("mihomo");
@@ -325,6 +339,8 @@ fn copy_regular(source: &Path, target: &Path, owner: Option<u32>) -> Result<()> 
             .mode(0o600)
             .open(&temporary)?;
         io::copy(&mut input, &mut output)?;
+        // Keep the source age so mihomo refreshes providers on their real schedule.
+        output.set_modified(input.metadata()?.modified()?)?;
         fs::rename(&temporary, target)?;
         Ok(())
     })();
@@ -347,10 +363,10 @@ fn copy_data(source: &Path, destination: &Path, owner: u32) -> Result<()> {
             root_directory(&target, 0o700)?;
             copy_data(&path, &target, owner)?;
         } else {
+            // Files the root core updated itself (providers, cache) are newer; keep them.
             let unchanged = fs::symlink_metadata(&target).ok().is_some_and(|dest| {
                 dest.is_file()
                     && dest.uid() == 0
-                    && metadata.len() == dest.len()
                     && metadata.modified().ok() <= dest.modified().ok()
             });
             if !unchanged {

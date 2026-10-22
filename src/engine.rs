@@ -73,11 +73,17 @@ impl Run {
 }
 pub fn start(settings: Settings, emit: Emit) -> Result<Arc<Run>> {
     settings.validate()?;
+    let uid = unsafe { libc::getuid() };
+    let sessions = config::home().join("Sessions");
+    config::prune_sessions(&sessions, |id| {
+        supervisor::running(&sessions.join(id))
+            || supervisor::running(&supervisor::root_session(uid, id))
+    });
     let id = Uuid::new_v4().to_string();
-    let stage = config::home().join("Sessions").join(&id);
+    let stage = sessions.join(&id);
     config::private_dir(&stage)?;
     let status_path = if settings.tun {
-        supervisor::root_session(unsafe { libc::getuid() }, &id)
+        supervisor::root_session(uid, &id)
     } else {
         stage.clone()
     };
@@ -97,6 +103,8 @@ pub fn start(settings: Settings, emit: Emit) -> Result<Arc<Run>> {
     let background = run.clone();
     thread::spawn(move || {
         let outcome = worker(&background, &emit);
+        // The runtime copy holds node credentials and the controller secret.
+        let _ = fs::remove_file(background.stage.join("config.yaml"));
         match outcome {
             Ok(()) => emit(Event::Stopped(background.id.clone())),
             Err(_)

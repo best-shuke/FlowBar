@@ -60,7 +60,7 @@ open ~/Applications/FlowBar.app
 | `profile.yaml` | 导入配置的副本，原文件不变 |
 | `settings.json` | 端口、模式、自启和节点选择 |
 | `Data/` | Geo 数据、provider 文件和缓存 |
-| `Sessions/` | 私密运行配置、启动日志和状态 |
+| `Sessions/` | 运行中的私密配置、启动日志和状态；会话结束后删除配置副本，仅保留最近 5 次已结束会话 |
 
 TUN 会话和资源缓存位于 `/Library/Application Support/FlowBar/<uid>/`，由 root 管理。会话结束后删除内核和私密配置副本。配置文件权限为 0600；日志可由当前用户查看。TUN DNS 使用 SystemConfiguration 会话键，退出后自动撤销。
 

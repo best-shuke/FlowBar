@@ -253,9 +253,16 @@ impl Delegate {
                 ui.message
             ))));
         }
-        let menu = NSMenu::new(mtm);
-        menu.setAutoenablesItems(false);
-        menu.setDelegate(Some(ProtocolObject::from_ref(self)));
+        let created = ui.menu.is_none();
+        let menu = ui.menu.clone().unwrap_or_else(|| {
+            let menu = NSMenu::new(mtm);
+            menu.setAutoenablesItems(false);
+            menu.setDelegate(Some(ProtocolObject::from_ref(self)));
+            menu
+        });
+        // Rebuild in place: replacing the status item's menu while it is open leaves the
+        // displayed copy stale (groups refreshed in menuWillOpen never appeared).
+        menu.removeAllItems();
         menu.addItem(&self.item(&format!("FlowBar · {}", ui.message), None, false, false));
         menu.addItem(&self.item(&ui.settings.profile_name, None, false, false));
         menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -351,8 +358,10 @@ impl Delegate {
         let quit = self.item("退出 FlowBar", Some(Action::Quit), true, false);
         quit.setKeyEquivalent(&NSString::from_str("q"));
         menu.addItem(&quit);
-        if let Some(item) = &ui.status_item {
-            item.setMenu(Some(&menu));
+        if created {
+            if let Some(item) = &ui.status_item {
+                item.setMenu(Some(&menu));
+            }
         }
         if let Some(window) = &ui.window {
             let metadata = fs::read_to_string(config::home().join("profile.yaml"))
@@ -566,9 +575,12 @@ impl Delegate {
     }
     fn drain(&self) {
         let events: Vec<_> = self.ivars().receiver.try_iter().collect();
+        let mut changed = false;
+        let mut errors = vec![];
         for event in events {
             let current = self.ivars().ui.borrow().run.as_ref().map(|r| r.id.clone());
             let mut error = None;
+            let mut handled = true;
             {
                 let mut ui = self.ivars().ui.borrow_mut();
                 match event {
@@ -605,7 +617,9 @@ impl Delegate {
                     }
                     Event::Groups(id, groups) if current.as_deref() == Some(&id) => {
                         ui.refreshing = false;
-                        if !groups.is_empty() {
+                        // Rebuilding an open menu closes its submenus; skip it when nothing changed.
+                        handled = !groups.is_empty() && groups != ui.groups;
+                        if handled {
                             ui.groups = groups;
                         }
                     }
@@ -626,14 +640,20 @@ impl Delegate {
                         ui.operation = false;
                         error = Some(anyhow::anyhow!(message));
                     }
-                    _ => {}
+                    _ => handled = false,
                 }
             }
-            if let Some(error) = error {
-                self.error(&error.to_string());
-            }
+            changed |= handled;
+            errors.extend(error);
         }
-        self.render();
+        if changed {
+            self.render();
+        }
+        // Alerts run a modal loop that can re-enter drain; showing them mid-batch would
+        // apply this batch's older events after newer ones.
+        for error in errors {
+            self.error(&error.to_string());
+        }
         self.advance_smoke();
     }
     fn advance_smoke(&self) {

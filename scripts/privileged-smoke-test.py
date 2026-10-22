@@ -39,7 +39,9 @@ def wait_for_status(session, expected, timeout=15):
 def authorize(session_id):
     command = shlex.join([str(BINARY), '--tun-launch', str(os.getpid()),
                           str(os.getuid()), session_id])
-    script = 'do shell script ' + json.dumps(command) + ' with administrator privileges'
+    # AppleScript does not understand JSON's \uXXXX escapes, so keep non-ASCII paths literal.
+    script = ('do shell script ' + json.dumps(command, ensure_ascii=False)
+              + ' with administrator privileges')
     return subprocess.run(['/usr/bin/osascript', '-e', script],
                           capture_output=True, text=True, timeout=180)
 

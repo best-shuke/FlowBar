@@ -17,6 +17,7 @@ pub const GEO_NAMES: &[&str] = &[
     "ASN.mmdb",
     "GeoIP.dat",
     "GeoSite.dat",
+    "geoip.metadb",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,6 +116,27 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     result
 }
 
+/// Removes ended session directories beyond the most recent few; `active` protects live ones.
+pub fn prune_sessions(sessions: &Path, active: impl Fn(&str) -> bool) {
+    const KEEP: usize = 5;
+    let Ok(entries) = fs::read_dir(sessions) else {
+        return;
+    };
+    let mut ended: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let id = entry.file_name().into_string().ok()?;
+            let metadata = entry.metadata().ok()?;
+            (metadata.is_dir() && Uuid::parse_str(&id).is_ok() && !active(&id))
+                .then(|| (metadata.modified().ok(), entry.path()))
+        })
+        .collect();
+    ended.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in ended.into_iter().skip(KEEP) {
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
 pub fn parse(yaml: &str) -> Result<Value> {
     let mut root: Value = serde_yaml_ng::from_str(yaml).context("YAML 语法错误")?;
     root.apply_merge().context("YAML 锚点或合并规则无效")?;
@@ -154,6 +176,16 @@ pub fn summary(yaml: &str) -> Result<Summary> {
 fn set(map: &mut Mapping, key: &str, value: impl Into<Value>) {
     map.insert(key.into(), value.into());
 }
+/// An empty section such as `tun:` parses as null; treat it like a missing one.
+fn section<'a>(map: &'a mut Mapping, key: &str) -> Result<&'a mut Mapping> {
+    let value = map.entry(Value::from(key)).or_insert(Value::Null);
+    if value.is_null() {
+        *value = Value::Mapping(Mapping::new());
+    }
+    value
+        .as_mapping_mut()
+        .with_context(|| format!("{key} 必须是 YAML 对象。"))
+}
 
 pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> {
     settings.validate()?;
@@ -169,6 +201,12 @@ pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> 
         "external-controller-pipe",
         "external-controller-cors",
         "listeners",
+        "tunnels",
+        "tuic-server",
+        "ss-config",
+        "vmess-config",
+        "tcptun-config",
+        "udptun-config",
         "iptables",
         "authentication",
     ] {
@@ -189,10 +227,7 @@ pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> 
     set(map, "mode", settings.mode.as_str());
     set(map, "log-level", "warning");
     set(map, "geodata-loader", "memconservative");
-    let tun = map
-        .entry(Value::from("tun"))
-        .or_insert_with(|| Value::Mapping(Mapping::new()));
-    let tun = tun.as_mapping_mut().context("tun 必须是 YAML 对象。")?;
+    let tun = section(map, "tun")?;
     set(tun, "enable", settings.tun);
     if settings.tun {
         set(tun, "device", "utun");
@@ -203,10 +238,7 @@ pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> 
         tun.entry(Value::from("dns-hijack"))
             .or_insert(serde_yaml_ng::to_value(["any:53", "tcp://any:53"])?);
     }
-    let dns = map
-        .entry(Value::from("dns"))
-        .or_insert_with(|| Value::Mapping(Mapping::new()));
-    let dns = dns.as_mapping_mut().context("dns 必须是 YAML 对象。")?;
+    let dns = section(map, "dns")?;
     set(dns, "listen", format!("127.0.0.1:{}", settings.dns_port));
     if settings.tun {
         set(dns, "enable", true);
@@ -270,6 +302,8 @@ pub fn copy_providers(yaml: &str, source: &Path, destination: &Path) -> Result<(
     Ok(())
 }
 pub fn import_profile(source: &Path, name: Option<&str>) -> Result<Settings> {
+    // A bare relative file name has an empty parent, which breaks provider lookup.
+    let source = &std::path::absolute(source).context("配置文件路径无效")?;
     let yaml = fs::read_to_string(source).context("无法读取 YAML 文件")?;
     summary(&yaml)?;
     private_dir(&home())?;
@@ -329,6 +363,34 @@ mod tests {
             Some("192.168.1.0/24")
         );
         assert_eq!(dns_port(&output).unwrap(), 15353);
+    }
+    #[test]
+    fn drops_extra_inbounds_and_accepts_empty_sections() {
+        let yaml = "proxies: []\ntunnels: [tcp/udp,0.0.0.0:6553,1.1.1.1:53,DIRECT]\nss-config: ss://aes-128-gcm:pw@:8388\ntuic-server: {enable: true, listen: 0.0.0.0:443}\ntun:\ndns:\n";
+        let root = parse(&runtime(yaml, &Settings::default(), "secret").unwrap()).unwrap();
+        for name in ["tunnels", "ss-config", "tuic-server"] {
+            assert!(root.get(name).is_none(), "{name} must not be kept");
+        }
+        assert_eq!(root["tun"]["enable"].as_bool(), Some(true));
+        assert_eq!(root["dns"]["listen"].as_str(), Some("127.0.0.1:15353"));
+    }
+    #[test]
+    fn prunes_only_old_ended_sessions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let ids: Vec<_> = (0..8).map(|_| Uuid::new_v4().to_string()).collect();
+        for (index, id) in ids.iter().enumerate() {
+            let path = temporary.path().join(id);
+            fs::create_dir(&path).unwrap();
+            let time = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(index as u64 * 60);
+            fs::File::open(&path).unwrap().set_modified(time).unwrap();
+        }
+        fs::create_dir(temporary.path().join("not-a-session")).unwrap();
+        prune_sessions(temporary.path(), |id| id == ids[0]);
+        let exists = |id: &str| temporary.path().join(id).exists();
+        assert!(exists(&ids[0]) && exists("not-a-session"));
+        assert!(ids[1..3].iter().all(|id| !exists(id)));
+        assert!(ids[3..].iter().all(|id| exists(id)));
     }
     #[test]
     fn rejects_duplicates_incomplete_yaml_and_bad_ports() {

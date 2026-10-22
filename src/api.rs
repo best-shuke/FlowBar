@@ -11,7 +11,7 @@ pub struct Api {
     pub port: u16,
     pub secret: String,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Group {
     pub name: String,
     pub kind: String,
