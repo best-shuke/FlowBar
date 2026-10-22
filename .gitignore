@@ -1,0 +1,21 @@
+.build/
+dist/
+.DS_Store
+*.local.yaml
+.agent-artifacts/
+target/
+*.app/
+*.log
+__pycache__/
+/profile.yaml
+/settings.json
+/Sessions/
+/Data/
+
+# Local Swift prototype; the maintained application is Rust.
+/Sources/
+/Tests/
+/Package.swift
+/Package.resolved
+/scripts/build-swift.sh
+/scripts/icon.swift

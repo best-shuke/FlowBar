@@ -1,0 +1,37 @@
+[package]
+name = "flowbar"
+version = "0.2.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Lightweight native macOS menu bar controller for mihomo"
+repository = "https://github.com/best-shuke/FlowBar"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+core-foundation = "0.10"
+dispatch2 = "0.3"
+libc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std", "NSAlert", "NSApplication", "NSBitmapImageRep", "NSButton", "NSCell", "NSColor",
+    "NSControl", "NSEvent", "NSFont", "NSGraphics", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem",
+    "NSOpenPanel", "NSPanel", "NSResponder", "NSRunningApplication", "NSSavePanel", "NSStatusBar",
+    "NSStatusBarButton", "NSStatusItem", "NSText", "NSTextField", "NSView", "NSWindow", "libc", "objc2-core-foundation"
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSData", "NSDistributedNotificationCenter", "NSNotification", "NSObject", "NSString", "NSGeometry", "NSURL", "NSThread"] }
+objc2-service-management = { version = "0.3", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+signal-hook = "0.3"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
