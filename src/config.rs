@@ -1,14 +1,26 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::{
     collections::BTreeMap,
     fs,
     io::Write,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
 };
 use uuid::Uuid;
+
+/// The per-user data directory below the home directory; root supervisors use it to find
+/// the user's copy.
+#[cfg(target_os = "macos")]
+pub const DATA_DIR: &str = "Library/Application Support/FlowBar";
+#[cfg(target_os = "linux")]
+pub const DATA_DIR: &str = ".local/share/flowbar";
+#[cfg(target_os = "macos")]
+const TUN_DEVICE: &str = "utun";
+#[cfg(not(target_os = "macos"))]
+const TUN_DEVICE: &str = "FlowBar";
 
 pub const GEO_NAMES: &[&str] = &[
     "geoip.dat",
@@ -80,33 +92,52 @@ impl Settings {
     }
 }
 
+#[cfg(unix)]
 pub fn home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").expect("HOME is required"))
-        .join("Library/Application Support/FlowBar")
+    PathBuf::from(std::env::var_os("HOME").expect("HOME is required")).join(DATA_DIR)
+}
+#[cfg(windows)]
+pub fn home() -> PathBuf {
+    PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA is required"))
+        .join("FlowBar")
+}
+/// Clash Verge Rev keeps its Geo data here; an import from it may reuse them.
+fn verge() -> Option<PathBuf> {
+    const ID: &str = "io.github.clash-verge-rev.clash-verge-rev";
+    #[cfg(unix)]
+    return home().parent().map(|parent| parent.join(ID));
+    #[cfg(windows)]
+    std::env::var_os("APPDATA").map(|roaming| PathBuf::from(roaming).join(ID))
 }
 pub fn private_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(path)?;
+    // The per-user application data directory is already private on Windows.
+    #[cfg(windows)]
+    fs::create_dir_all(path)?;
     ensure!(
         !fs::symlink_metadata(path)?.file_type().is_symlink(),
         "数据目录不能是符号链接。"
     );
+    #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write(path, bytes, 0o600)
 }
+#[cfg_attr(windows, allow(unused_variables))]
 pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let temporary = path.with_file_name(format!(".flowbar-{}", Uuid::new_v4()));
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(&temporary)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(mode);
+        let mut file = options.open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
@@ -135,7 +166,7 @@ pub fn prune_sessions(sessions: &Path, active: impl Fn(&str) -> bool) {
                 .then(|| (metadata.modified().ok(), entry.path()))
         })
         .collect();
-    ended.sort_by(|a, b| b.0.cmp(&a.0));
+    ended.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     for (index, (_, path)) in ended.into_iter().enumerate() {
         if index < KEEP {
             let _ = fs::remove_file(path.join("config.yaml"));
@@ -243,7 +274,7 @@ pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> 
     let tun = section(map, "tun")?;
     set(tun, "enable", settings.tun);
     if settings.tun {
-        set(tun, "device", "utun");
+        set(tun, "device", TUN_DEVICE);
         set(tun, "auto-route", true);
         set(tun, "auto-detect-interface", true);
         tun.entry(Value::from("stack"))
@@ -261,6 +292,7 @@ pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> 
     Ok(serde_yaml_ng::to_string(&root)?)
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn dns_port(yaml: &str) -> Result<u16> {
     let root = parse(yaml)?;
     let listen = root["dns"]["listen"].as_str().context("DNS 监听地址无效")?;
@@ -329,11 +361,7 @@ pub fn import_profile(source: &Path, name: Option<&str>) -> Result<Settings> {
     private_dir(&data)?;
     let directory = source.parent().context("配置文件路径无效")?;
     seed_geo(directory, &data)?;
-    let verge = home()
-        .parent()
-        .unwrap()
-        .join("io.github.clash-verge-rev.clash-verge-rev");
-    if source.starts_with(&verge) {
+    if let Some(verge) = verge().filter(|verge| source.starts_with(verge)) {
         seed_geo(&verge, &data)?;
     }
     copy_providers(&yaml, directory, &data)?;
@@ -408,7 +436,13 @@ mod tests {
             fs::write(path.join("config.yaml"), "secret: x").unwrap();
             let time = std::time::SystemTime::UNIX_EPOCH
                 + std::time::Duration::from_secs(index as u64 * 60);
-            fs::File::open(&path).unwrap().set_modified(time).unwrap();
+            let mut options = fs::File::options();
+            options.read(true);
+            // Windows opens directories only with backup semantics.
+            #[cfg(windows)]
+            std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x0200_0000)
+                .write(true);
+            options.open(&path).unwrap().set_modified(time).unwrap();
         }
         fs::create_dir(temporary.path().join("not-a-session")).unwrap();
         prune_sessions(temporary.path(), |id| id == ids[0]);
@@ -461,6 +495,8 @@ mod tests {
         let copied = fs::metadata(target.join("rules/test.yaml")).unwrap();
         assert!(copied.is_file() && copied.modified().unwrap() == age);
         assert!(copy_providers(&yaml.replace("./rules/", "../"), &source, &target).is_err());
+        // Creating a symlink on Windows needs developer mode or administrator rights.
+        #[cfg(unix)]
         std::os::unix::fs::symlink(source.join("rules/test.yaml"), source.join("link.yaml"))
             .unwrap();
         assert!(

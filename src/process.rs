@@ -1,21 +1,39 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
+#[cfg(unix)]
+use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
+#[cfg(windows)]
+use std::os::windows::{
+    io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    process::CommandExt,
+};
 use std::{
     fs,
     io::{Read, Seek, SeekFrom},
-    os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{fs::OpenOptionsExt, process::CommandExt},
-    },
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    System::{
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        },
+        Threading::{
+            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, OpenProcess, PROCESS_SYNCHRONIZE,
+            PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+        },
+    },
+};
 
 pub struct Output {
     pub status: ExitStatus,
@@ -25,21 +43,20 @@ pub fn command(
     mut command: Command,
     timeout: Duration,
     cancelled: &AtomicBool,
-    pid: &AtomicI32,
+    pid: &AtomicU32,
 ) -> Result<Output> {
     let path = std::env::temp_dir().join(format!("flowbar-{}.log", Uuid::new_v4()));
-    let mut log = fs::OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)?;
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).read(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut log = options.open(&path)?;
     let result = (|| {
-        command
+        background(&mut command)
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log.try_clone()?));
         let mut child = ManagedChild::new(command.spawn()?);
-        pid.store(child.0.id() as i32, Ordering::SeqCst);
+        pid.store(child.0.id(), Ordering::SeqCst);
         let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(status) = child.0.try_wait()? {
@@ -59,9 +76,11 @@ pub fn command(
     let _ = fs::remove_file(path);
     result
 }
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
+#[cfg(target_os = "macos")]
 pub fn apple_string(value: &str) -> String {
     format!(
         "\"{}\"",
@@ -73,7 +92,40 @@ pub fn apple_string(value: &str) -> String {
     )
 }
 
+/// Keeps console programs such as mihomo and curl from opening a console window on Windows.
+pub fn background(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+/// A child environment without the user's proxy variables or other settings. HOME and
+/// program-specific variables are left to the caller.
+pub fn clean_env(command: &mut Command) -> &mut Command {
+    command.env_clear();
+    #[cfg(unix)]
+    command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    // Winsock and the TLS stack fail to start without the system directories.
+    #[cfg(windows)]
+    for name in [
+        "SystemRoot",
+        "SystemDrive",
+        "windir",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "ProgramData",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+}
+
 /// Starts a separate session without relying on a terminal or shell job control.
+#[cfg(unix)]
 pub fn spawn_detached(command: &mut Command) -> Result<ManagedChild> {
     command.stdin(Stdio::null());
     unsafe {
@@ -85,6 +137,60 @@ pub fn spawn_detached(command: &mut Command) -> Result<ManagedChild> {
         });
     }
     Ok(ManagedChild::new(command.spawn()?))
+}
+/// Starts a process that outlives this one and does not share its console.
+#[cfg(windows)]
+pub fn spawn_detached(command: &mut Command) -> Result<ManagedChild> {
+    command
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    Ok(ManagedChild::new(command.spawn()?))
+}
+
+/// Whether a process exists. Unlike a child handle, this works for any process ID.
+#[cfg(unix)]
+pub fn alive(pid: u32) -> bool {
+    // Zero and negative IDs would address process groups.
+    (1..=i32::MAX as u32).contains(&pid)
+        && (unsafe { libc::kill(pid as i32, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+#[cfg(windows)]
+pub fn alive(pid: u32) -> bool {
+    open(pid, PROCESS_SYNCHRONIZE)
+        .is_some_and(|process| unsafe { WaitForSingleObject(raw(&process), 0) } == WAIT_TIMEOUT)
+}
+/// Asks a process to exit; on Windows, where there is no such request, ends it.
+pub fn terminate(pid: u32) {
+    #[cfg(unix)]
+    if (1..=i32::MAX as u32).contains(&pid) {
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
+    #[cfg(windows)]
+    if let Some(process) = open(pid, PROCESS_TERMINATE) {
+        unsafe { TerminateProcess(raw(&process), 1) };
+    }
+}
+/// Waits up to `timeout` for a process that is not our child to exit.
+#[cfg(any(not(target_os = "macos"), test))]
+pub fn wait_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while alive(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+#[cfg(windows)]
+fn open(pid: u32, access: u32) -> Option<OwnedHandle> {
+    let handle = unsafe { OpenProcess(access, 0, pid) };
+    (!handle.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(handle) })
+}
+#[cfg(windows)]
+fn raw(handle: &OwnedHandle) -> HANDLE {
+    handle.as_raw_handle()
 }
 
 pub struct ManagedChild(pub Child, bool);
@@ -100,15 +206,19 @@ impl ManagedChild {
         if matches!(self.0.try_wait(), Ok(Some(_))) {
             return;
         }
-        unsafe {
-            libc::kill(self.0.id() as i32, libc::SIGTERM);
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if matches!(self.0.try_wait(), Ok(Some(_))) {
-                return;
+        // Windows has no termination request, so the process is ended right away.
+        #[cfg(unix)]
+        {
+            unsafe {
+                libc::kill(self.0.id() as i32, libc::SIGTERM);
             }
-            thread::sleep(Duration::from_millis(25));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if matches!(self.0.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
         }
         let _ = self.0.kill();
         let _ = self.0.wait();
@@ -122,9 +232,12 @@ impl Drop for ManagedChild {
     }
 }
 
-struct ParentWatch(OwnedFd);
+#[cfg(target_os = "macos")]
+struct ParentWatch(std::os::fd::OwnedFd);
+#[cfg(target_os = "macos")]
 impl ParentWatch {
-    fn new(parent: i32) -> Result<Self> {
+    fn new(parent: u32) -> Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         ensure!(parent > 1, "父进程无效");
         let fd = unsafe { libc::kqueue() };
         ensure!(fd >= 0, "无法监听主程序退出");
@@ -150,7 +263,9 @@ impl ParentWatch {
         ensure!(result == 0, "主程序已经退出或无法监听");
         Ok(watch)
     }
+    /// Waits up to a second; true once the parent has exited.
     fn parent_exited(&self) -> Result<bool> {
+        use std::os::fd::AsRawFd;
         let mut event: libc::kevent = unsafe { std::mem::zeroed() };
         let timeout = libc::timespec {
             tv_sec: 1,
@@ -167,15 +282,103 @@ impl ParentWatch {
             )
         };
         if count < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            bail!("进程监听失败");
+            anyhow::bail!("进程监听失败");
         }
         Ok(count > 0)
     }
 }
 
+/// A pidfd reports the parent's exit even after its PID is reused. Kernels before 5.3
+/// lack it, so those poll the PID instead.
+#[cfg(target_os = "linux")]
+struct ParentWatch(Option<std::os::fd::OwnedFd>, u32);
+#[cfg(target_os = "linux")]
+impl ParentWatch {
+    fn new(parent: u32) -> Result<Self> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        ensure!(parent > 1, "父进程无效");
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, parent as libc::pid_t, 0) };
+        if fd >= 0 {
+            return Ok(Self(
+                Some(unsafe { OwnedFd::from_raw_fd(fd as i32) }),
+                parent,
+            ));
+        }
+        let missing = std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        ensure!(!missing && alive(parent), "主程序已经退出或无法监听");
+        Ok(Self(None, parent))
+    }
+    /// Waits up to a second; true once the parent has exited.
+    fn parent_exited(&self) -> Result<bool> {
+        use std::os::fd::AsRawFd;
+        let Some(fd) = &self.0 else {
+            thread::sleep(Duration::from_secs(1));
+            return Ok(!alive(self.1));
+        };
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let count = unsafe { libc::poll(&mut poll, 1, 1000) };
+        if count < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            anyhow::bail!("进程监听失败");
+        }
+        Ok(count > 0)
+    }
+}
+
+#[cfg(windows)]
+struct ParentWatch(OwnedHandle);
+#[cfg(windows)]
+impl ParentWatch {
+    fn new(parent: u32) -> Result<Self> {
+        ensure!(parent > 0, "父进程无效");
+        let process = open(parent, PROCESS_SYNCHRONIZE).context("主程序已经退出或无法监听")?;
+        Ok(Self(process))
+    }
+    /// Waits up to a second; true once the parent has exited.
+    fn parent_exited(&self) -> Result<bool> {
+        Ok(unsafe { WaitForSingleObject(raw(&self.0), 1000) } == WAIT_OBJECT_0)
+    }
+}
+
+/// Ends the core together with its supervisor, even when the supervisor itself is killed.
+#[cfg(windows)]
+fn kill_on_close(child: &Child) -> Result<OwnedHandle> {
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    ensure!(!job.is_null(), "无法创建进程作业");
+    let job = unsafe { OwnedHandle::from_raw_handle(job) };
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    ensure!(
+        unsafe {
+            SetInformationJobObject(
+                raw(&job),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } != 0
+            && unsafe { AssignProcessToJobObject(raw(&job), child.as_raw_handle()) } != 0,
+        "无法设置进程作业"
+    );
+    Ok(job)
+}
+
+#[cfg(unix)]
+struct Signals(signal_hook::SigId, signal_hook::SigId);
+#[cfg(unix)]
+impl Drop for Signals {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.0);
+        signal_hook::low_level::unregister(self.1);
+    }
+}
+
 pub fn supervise(
     mut child_command: Command,
-    parent: i32,
+    parent: u32,
     stop_file: &Path,
     log: Option<&fs::File>,
     on_started: impl FnOnce(u32, &AtomicBool) -> Result<()>,
@@ -183,17 +386,26 @@ pub fn supervise(
     let watch = ParentWatch::new(parent)?;
     ensure!(!stop_file.exists(), "连接已取消");
     let signalled = Arc::new(AtomicBool::new(false));
-    let term = signal_hook::flag::register(libc::SIGTERM, signalled.clone())?;
-    let interrupt = signal_hook::flag::register(libc::SIGINT, signalled.clone())?;
-    struct Signals(signal_hook::SigId, signal_hook::SigId);
-    impl Drop for Signals {
-        fn drop(&mut self) {
-            signal_hook::low_level::unregister(self.0);
-            signal_hook::low_level::unregister(self.1);
-        }
+    #[cfg(unix)]
+    let _signals = Signals(
+        signal_hook::flag::register(libc::SIGTERM, signalled.clone())?,
+        signal_hook::flag::register(libc::SIGINT, signalled.clone())?,
+    );
+    // The core also stops if this supervisor is killed.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        child_command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
-    let _signals = Signals(term, interrupt);
+    background(&mut child_command);
     let mut child = ManagedChild::new(child_command.spawn().context("无法启动 mihomo")?);
+    // Best effort: a job that forbids nesting cannot take the core.
+    #[cfg(windows)]
+    let _job = kill_on_close(&child.0).ok();
     on_started(child.0.id(), &signalled)?;
     loop {
         if let Some(status) = child.0.try_wait()? {
@@ -215,13 +427,21 @@ pub fn supervise(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::bail;
     fn sleeper() -> Command {
+        #[cfg(unix)]
         let mut c = Command::new("/bin/sleep");
+        #[cfg(unix)]
         c.arg("30");
+        #[cfg(windows)]
+        let mut c = Command::new("ping");
+        #[cfg(windows)]
+        c.args(["-n", "30", "127.0.0.1"]).stdout(Stdio::null());
         c
     }
+    #[cfg(unix)]
     #[test]
-    fn quoting_and_timeout() {
+    fn quoting() {
         let input = "spaces ' double \" $(printf unsafe) `id` \n尾";
         let mut c = Command::new("/bin/sh");
         c.args(["-c", &format!("printf %s {}", shell_quote(input))]);
@@ -229,17 +449,20 @@ mod tests {
             c,
             Duration::from_secs(2),
             &AtomicBool::new(false),
-            &AtomicI32::new(0),
+            &AtomicU32::new(0),
         )
         .unwrap();
         assert_eq!(String::from_utf8(output.output).unwrap(), input);
+    }
+    #[test]
+    fn timeout() {
         let start = Instant::now();
         assert!(
             command(
                 sleeper(),
                 Duration::from_millis(50),
                 &AtomicBool::new(false),
-                &AtomicI32::new(0)
+                &AtomicU32::new(0)
             )
             .is_err()
         );
@@ -249,22 +472,21 @@ mod tests {
     fn parent_exit_stops_child() {
         let mut parent = ManagedChild::new(sleeper().spawn().unwrap());
         let tmp = tempfile::tempdir().unwrap();
+        let parent_id = parent.0.id();
         let mut child_id = 0;
         supervise(
             sleeper(),
-            parent.0.id() as i32,
+            parent_id,
             &tmp.path().join("stop"),
             None,
             |pid, _| {
                 child_id = pid;
-                unsafe {
-                    libc::kill(parent.0.id() as i32, libc::SIGTERM);
-                }
+                parent.0.kill()?;
                 Ok(())
             },
         )
         .unwrap();
-        assert_eq!(unsafe { libc::kill(child_id as i32, 0) }, -1);
+        assert!(!alive(child_id));
         let _ = parent.0.wait();
     }
     #[test]
@@ -273,23 +495,26 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let stop = tmp.path().join("stop");
             let mut child_id = 0;
-            let result = supervise(
-                sleeper(),
-                std::process::id() as i32,
-                &stop,
-                None,
-                |pid, _| {
-                    child_id = pid;
-                    if fail {
-                        bail!("startup failed")
-                    }
-                    fs::write(&stop, [])?;
-                    Ok(())
-                },
-            );
+            let result = supervise(sleeper(), std::process::id(), &stop, None, |pid, _| {
+                child_id = pid;
+                if fail {
+                    bail!("startup failed")
+                }
+                fs::write(&stop, [])?;
+                Ok(())
+            });
             assert_eq!(result.is_err(), fail);
-            assert_eq!(unsafe { libc::kill(child_id as i32, 0) }, -1);
+            assert!(!alive(child_id));
         }
+    }
+    #[test]
+    fn terminate_and_wait_for_unrelated_process() {
+        let mut child = sleeper().spawn().unwrap();
+        let pid = child.id();
+        assert!(alive(pid) && !wait_exit(pid, Duration::from_millis(100)));
+        terminate(pid);
+        let _ = child.wait();
+        assert!(!alive(pid) && wait_exit(pid, Duration::from_millis(100)));
     }
 
     #[test]
@@ -297,11 +522,14 @@ mod tests {
         let mut command = sleeper();
         command.stdout(Stdio::null()).stderr(Stdio::null());
         let child = spawn_detached(&mut command).unwrap();
-        let pid = child.0.id() as i32;
-        assert_eq!(unsafe { libc::getsid(pid) }, pid);
-        assert_ne!(unsafe { libc::getsid(0) }, pid);
+        let pid = child.0.id();
+        #[cfg(unix)]
+        {
+            assert_eq!(unsafe { libc::getsid(pid as i32) }, pid as i32);
+            assert_ne!(unsafe { libc::getsid(0) }, pid as i32);
+        }
         drop(child);
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert!(!alive(pid));
         assert!(spawn_detached(&mut Command::new("/flowbar-missing-executable")).is_err());
     }
 }

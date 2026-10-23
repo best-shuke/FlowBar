@@ -1,3 +1,6 @@
+// A tray app has no console window; command-line use attaches to the caller's console.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod api;
 mod config;
 mod engine;
@@ -14,18 +17,39 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "macos")]
+const TOOLKIT: &str = "native AppKit";
+#[cfg(windows)]
+const TOOLKIT: &str = "native Win32";
+#[cfg(target_os = "linux")]
+const TOOLKIT: &str = "GTK 4";
+
 fn entry() -> Result<()> {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if arguments
+        .first()
+        .is_some_and(|a| !ui::ARGUMENTS.contains(&a.as_str()))
+    {
+        console::attach();
+    }
     match arguments.first().map(String::as_str) {
-        Some("--version") => println!(
-            "FlowBar {} (Rust, native AppKit)",
-            env!("CARGO_PKG_VERSION")
-        ),
+        Some("--version") => println!("FlowBar {} (Rust, {TOOLKIT})", env!("CARGO_PKG_VERSION")),
+        #[cfg(unix)]
         Some("--tun-launch") if arguments.len() == 4 => {
             supervisor::root_launch(arguments[1].parse()?, arguments[2].parse()?, &arguments[3])?
         }
+        #[cfg(unix)]
         Some("--tun-supervise") if arguments.len() == 4 => {
             supervisor::root_main(arguments[1].parse()?, arguments[2].parse()?, &arguments[3])?
+        }
+        #[cfg(windows)]
+        Some("--tun-launch") if arguments.len() == 3 => {
+            supervisor::root_launch(arguments[1].parse()?, Path::new(&arguments[2]))?
+        }
+        #[cfg(windows)]
+        Some("--tun-supervise") if arguments.len() == 3 => {
+            supervisor::root_main(arguments[1].parse()?, Path::new(&arguments[2]))?
         }
         Some("--user-supervise") if arguments.len() == 3 => {
             supervisor::user_main(arguments[1].parse()?, &arguments[2])?
@@ -62,23 +86,18 @@ fn entry() -> Result<()> {
             Some(release) => println!("可以更新到 {}：{}", release.version(), release.html_url),
             None => println!("已是最新版本（{}）。", update::CURRENT),
         },
-        Some("--login-status") => {
-            objc2::rc::autoreleasepool(|_| println!("{:?}", ui::login_status()))
-        }
+        Some("--login-status") => println!("{:?}", ui::login_status()),
         Some("--engine-smoke") => engine_smoke()?,
-        Some(value)
-            if value.starts_with("--")
-                && ![
-                    "--show-settings",
-                    "--snapshot",
-                    "--no-autoconnect",
-                    "--ui-smoke",
-                ]
-                .contains(&value) =>
-        {
+        // The new version after an in-app update, started by the old one.
+        #[cfg(not(target_os = "macos"))]
+        Some("--updated") if arguments.len() == 3 => {
+            update::finish(arguments[1].parse()?, Path::new(&arguments[2]));
+            ui::run()?
+        }
+        Some(value) if value.starts_with("--") && !ui::ARGUMENTS.contains(&value) => {
             bail!("未知参数或参数数量无效")
         }
-        _ => objc2::rc::autoreleasepool(|_| ui::run())?,
+        _ => ui::run()?,
     }
     Ok(())
 }
@@ -143,5 +162,44 @@ fn main() {
     if let Err(error) = entry() {
         eprintln!("{error:#}");
         std::process::exit(1);
+    }
+}
+
+/// A GUI-subsystem program has no standard output of its own on Windows.
+#[cfg(windows)]
+mod console {
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{CreateFileW, FILE_SHARE_WRITE, OPEN_EXISTING},
+        System::Console::{
+            ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE,
+            STD_OUTPUT_HANDLE, SetStdHandle,
+        },
+    };
+    /// Prints to the console of the command prompt that started us, unless output is
+    /// already redirected, for example to a pipe of the update check.
+    pub fn attach() {
+        unsafe {
+            let output = GetStdHandle(STD_OUTPUT_HANDLE);
+            if !(output.is_null() || output == INVALID_HANDLE_VALUE)
+                || AttachConsole(ATTACH_PARENT_PROCESS) == 0
+            {
+                return;
+            }
+            let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+            let console = CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            if console != INVALID_HANDLE_VALUE {
+                SetStdHandle(STD_OUTPUT_HANDLE, console);
+                SetStdHandle(STD_ERROR_HANDLE, console);
+            }
+        }
     }
 }

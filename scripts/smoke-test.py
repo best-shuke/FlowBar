@@ -5,6 +5,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import platform
 import socket
 import subprocess
 import tempfile
@@ -12,10 +13,20 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
-APP = ROOT / 'dist/FlowBar.app/Contents'
-GUI = APP / 'MacOS/FlowBar'
-CORE = APP / 'Resources/mihomo'
-DATA = Path.home() / 'Library/Application Support/FlowBar/Data'
+SYSTEM = platform.system()
+if SYSTEM == 'Darwin':
+    GUI = ROOT / 'dist/FlowBar.app/Contents/MacOS/FlowBar'
+    CORE = ROOT / 'dist/FlowBar.app/Contents/Resources/mihomo'
+    HOME = Path.home() / 'Library/Application Support/FlowBar'
+elif SYSTEM == 'Windows':
+    GUI = ROOT / 'dist/FlowBar/FlowBar.exe'
+    CORE = ROOT / 'dist/FlowBar/mihomo.exe'
+    HOME = Path(os.environ['LOCALAPPDATA']) / 'FlowBar'
+else:
+    GUI = ROOT / 'dist/FlowBar/flowbar'
+    CORE = ROOT / 'dist/FlowBar/mihomo'
+    HOME = Path.home() / '.local/share/flowbar'
+DATA = HOME / 'Data'
 TOKEN = 'flowbar-local-smoke-test-token'
 PORTS = (17890, 19090, 15353)
 
@@ -47,6 +58,8 @@ def validate(path, directory):
 
 def launch(config, directory, log):
     env = {'HOME': str(Path.home()), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'GOGC': '50'}
+    if SYSTEM == 'Windows':
+        env = {name: os.environ[name] for name in ('SystemRoot', 'TEMP', 'USERPROFILE') if name in os.environ}
     process = subprocess.Popen([str(CORE), '-d', str(directory), '-f', str(config)],
                                stdout=log, stderr=log, env=env)
     for _ in range(100):
@@ -73,7 +86,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 with tempfile.TemporaryDirectory(prefix='flowbar-smoke-') as temp:
     temp = Path(temp)
     os.chmod(temp, 0o700)
-    original = Path.home() / 'Library/Application Support/FlowBar/profile.yaml'
+    original = HOME / 'profile.yaml'
     if original.exists():
         for tun in [False, True]:
             config = temp / ('tun-validation.yaml' if tun else 'runtime.yaml')
@@ -101,8 +114,9 @@ with tempfile.TemporaryDirectory(prefix='flowbar-smoke-') as temp:
                 if group.get('now'):
                     api(path, 'PUT', {'name': group['now']})
                 print('PASS authenticated control API, mode changes, node selection')
-                rss = int(subprocess.check_output(['/bin/ps', '-p', str(process.pid), '-o', 'rss=']).strip())
-                print(f'INFO imported profile core, TUN disabled, startup RSS: {rss / 1024:.1f} MiB')
+                if SYSTEM != 'Windows':
+                    rss = int(subprocess.check_output(['ps', '-p', str(process.pid), '-o', 'rss=']).strip())
+                    print(f'INFO imported profile core, TUN disabled, startup RSS: {rss / 1024:.1f} MiB')
             finally:
                 process.terminate()
                 process.wait(timeout=8)

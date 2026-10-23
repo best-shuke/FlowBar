@@ -1,0 +1,29 @@
+// Embedded by build.rs when building for Windows.
+#include <winver.h>
+
+1 ICON "AppIcon.ico"
+// RT_MANIFEST, as the process manifest.
+1 24 "FlowBar.manifest"
+
+1 VERSIONINFO
+FILEVERSION VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH, 0
+PRODUCTVERSION VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH, 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "FileDescription", "FlowBar"
+            VALUE "FileVersion", VERSION_STRING
+            VALUE "OriginalFilename", "FlowBar.exe"
+            VALUE "ProductName", "FlowBar"
+            VALUE "ProductVersion", VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

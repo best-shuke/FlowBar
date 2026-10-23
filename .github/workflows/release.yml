@@ -12,48 +12,128 @@ concurrency:
 
 env:
   MIHOMO_VERSION: v1.19.33
-  MIHOMO_SHA256: 060b64b0f2c9a310831db0fe4adb2878de67bfa606c311813c1f13966aa504b6
 
 jobs:
-  release:
-    runs-on: macos-15
+  build:
+    name: ${{ matrix.system }}-${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-15
+            system: macos
+            arch: arm64
+            core: darwin-arm64
+            sha256: 060b64b0f2c9a310831db0fe4adb2878de67bfa606c311813c1f13966aa504b6
+          - os: ubuntu-22.04
+            system: linux
+            arch: x86_64
+            core: linux-amd64-compatible
+            sha256: 386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6
+          - os: ubuntu-22.04-arm
+            system: linux
+            arch: arm64
+            core: linux-arm64
+            sha256: ba408b317080ee265c46cb923a50018c1b82cbd708551cdd46a1e3e307396187
+          - os: windows-2022
+            system: windows
+            arch: x86_64
+            core: windows-amd64-compatible
+            sha256: 7aaf636a4f2172dcd8ec34ac4f52797b059195e5afd6409508c963e545f8864d
+          # Cross-built: the x64 runner has the ARM64 MSVC tools.
+          - os: windows-2022
+            system: windows
+            arch: arm64
+            target: aarch64-pc-windows-msvc
+            core: windows-arm64
+            sha256: a2a26869a14634c49f3fbcecc593b498ed8591fbdd7616b24475b3d60b148da3
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
+
+      - name: Locate core
+        run: echo "CORE=$RUNNER_TEMP/mihomo${{ matrix.system == 'windows' && '.exe' || '' }}" >> "$GITHUB_ENV"
 
       - name: Check version
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
-          PLIST_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - Resources/Info.plist)"
+          PLIST_VERSION="$(sed -n 's/.*<key>CFBundleShortVersionString<\/key><string>\(.*\)<\/string>.*/\1/p' Resources/Info.plist)"
           if [ "$VERSION" != "$CARGO_VERSION" ] || [ "$VERSION" != "$PLIST_VERSION" ]; then
             echo "::error::Tag $GITHUB_REF_NAME, Cargo.toml $CARGO_VERSION and Info.plist $PLIST_VERSION must match."
             exit 1
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
-      - name: Fetch mihomo
+      - name: Install Rust
         run: |
-          curl -fsSL -o mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/$MIHOMO_VERSION/mihomo-darwin-arm64-$MIHOMO_VERSION.gz"
-          echo "$MIHOMO_SHA256  mihomo.gz" | shasum -a 256 -c -
-          gunzip mihomo.gz
-          chmod 755 mihomo
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          if [ -n "${{ matrix.target }}" ]; then
+            rustup target add ${{ matrix.target }}
+          fi
+
+      - name: Install Linux dependencies
+        if: matrix.system == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev
+
+      - name: Fetch mihomo
+        run: ./scripts/fetch-mihomo.sh "$MIHOMO_VERSION" ${{ matrix.core }} ${{ matrix.sha256 }} "$CORE"
 
       # scripts/licenses.py reads the locked dependency sources offline.
       - name: Test
         run: |
           cargo fetch --locked
-          cargo test --locked -- --test-threads=1
+          if [ -z "${{ matrix.target }}" ]; then
+            cargo test --locked -- --test-threads=1
+          fi
 
       - name: Build
-        run: ./scripts/build.sh "$PWD/mihomo"
+        run: |
+          case ${{ matrix.system }} in
+            macos) ./scripts/build.sh "$CORE" ;;
+            linux) ./scripts/build-linux.sh "$CORE" ;;
+            windows) pwsh -File scripts/build-windows.ps1 -Core "$CORE" -Target "${{ matrix.target }}" ;;
+          esac
+
+      - name: Package
+        run: |
+          ASSET="FlowBar-$VERSION-${{ matrix.system }}-${{ matrix.arch }}"
+          case ${{ matrix.system }} in
+            macos) ditto -c -k --keepParent dist/FlowBar.app "$ASSET.zip" ;;
+            linux) tar -C dist -czf "$ASSET.tar.gz" FlowBar ;;
+            # Python writes portable zip paths, which the in-app update unpacks with tar.
+            windows) python -c "import shutil, sys; shutil.make_archive(sys.argv[1], 'zip', 'dist', 'FlowBar')" "$ASSET" ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.system }}-${{ matrix.arch }}
+          path: FlowBar-*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ASSET="FlowBar-$VERSION-macos-arm64.zip"
-          ditto -c -k --keepParent dist/FlowBar.app "$ASSET"
-          gh release create "$GITHUB_REF_NAME" "$ASSET" \
-            --title "FlowBar $VERSION" \
+          gh release create "$GITHUB_REF_NAME" assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "FlowBar ${GITHUB_REF_NAME#v}" \
             --notes "内置 mihomo $MIHOMO_VERSION（GPL-3.0，源码：https://github.com/MetaCubeX/mihomo/tree/$MIHOMO_VERSION）。" \
             --generate-notes

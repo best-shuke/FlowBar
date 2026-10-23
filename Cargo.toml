@@ -3,15 +3,25 @@ name = "flowbar"
 version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
-description = "Lightweight native macOS menu bar controller for mihomo"
+description = "Lightweight native menu bar and tray controller for mihomo"
 repository = "https://github.com/best-shuke/FlowBar"
 license = "MIT"
 
 [dependencies]
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+signal-hook = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 dispatch2 = "0.3"
-libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std", "NSAlert", "NSApplication", "NSBezierPath", "NSBitmapImageRep", "NSButton", "NSCell", "NSColor",
@@ -22,11 +32,22 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSData", "NSDistributedNotificationCenter", "NSNotification", "NSObject", "NSString", "NSGeometry", "NSURL", "NSThread"] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "objc2-core-foundation", "objc2-core-graphics"] }
 objc2-service-management = { version = "0.3", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml_ng = "0.10"
-signal-hook = "0.3"
-uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { package = "gtk4", version = "0.10" }
+ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Console",
+    "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects", "Win32_System_LibraryLoader",
+    "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-resource = "3"
 
 [dev-dependencies]
 tempfile = "3"

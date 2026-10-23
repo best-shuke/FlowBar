@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Exercise real macOS authorization and detached root supervision without TUN.
+"""Exercise real administrator authorization and detached root supervision without TUN.
 
 Uses a local DIRECT-only fixture and temporary ports. The system displays its
-normal administrator authorization dialog. Existing preferences stay untouched.
+normal administrator authorization dialog: osascript on macOS, pkexec on Linux,
+or sudo with FLOWBAR_AUTHORIZE=sudo. Existing preferences stay untouched.
 """
 import http.client
 import json
 import os
 from pathlib import Path
+import platform
 import shlex
 import shutil
 import socket
@@ -16,9 +18,16 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
-BINARY = ROOT / 'dist/FlowBar.app/Contents/MacOS/FlowBar'
-USER_DATA = Path.home() / 'Library/Application Support/FlowBar'
-assert os.geteuid() != 0, 'Run as your normal macOS user'
+MACOS = platform.system() == 'Darwin'
+if MACOS:
+    BINARY = ROOT / 'dist/FlowBar.app/Contents/MacOS/FlowBar'
+    USER_DATA = Path.home() / 'Library/Application Support/FlowBar'
+    ROOT_BASE = Path('/Library/Application Support/FlowBar')
+else:
+    BINARY = ROOT / 'dist/FlowBar/flowbar'
+    USER_DATA = Path.home() / '.local/share/flowbar'
+    ROOT_BASE = Path('/var/lib/flowbar')
+assert os.geteuid() != 0, 'Run as your normal user'
 assert BINARY.is_file(), 'Build FlowBar first'
 (USER_DATA / 'Data').mkdir(parents=True, mode=0o700, exist_ok=True)
 
@@ -37,8 +46,11 @@ def wait_for_status(session, expected, timeout=15):
 
 
 def authorize(session_id):
-    command = shlex.join([str(BINARY), '--tun-launch', str(os.getpid()),
-                          str(os.getuid()), session_id])
+    arguments = [str(BINARY), '--tun-launch', str(os.getpid()), str(os.getuid()), session_id]
+    if not MACOS:
+        tool = ['sudo', '-n'] if os.environ.get('FLOWBAR_AUTHORIZE') == 'sudo' else ['pkexec']
+        return subprocess.run(tool + arguments, capture_output=True, text=True, timeout=180)
+    command = shlex.join(arguments)
     # AppleScript does not understand JSON's \uXXXX escapes, so keep non-ASCII paths literal.
     script = ('do shell script ' + json.dumps(command, ensure_ascii=False)
               + ' with administrator privileges')
@@ -50,7 +62,7 @@ for should_fail in [True, False]:
     session_id = str(uuid.uuid4())
     stage = USER_DATA / 'Sessions' / session_id
     stage.mkdir(parents=True, mode=0o700)
-    session = Path('/Library/Application Support/FlowBar') / str(os.getuid()) / 'Sessions' / session_id
+    session = ROOT_BASE / str(os.getuid()) / 'Sessions' / session_id
     try:
         if not should_fail:
             sockets = [socket.socket() for _ in range(2)]
@@ -97,7 +109,7 @@ rules: ["MATCH,DIRECT"]
             connection.close()
             (stage / 'stop').touch(mode=0o600)
             wait_for_status(session, 'stopped')
-            assert subprocess.run(['/bin/ps', '-p', str(status['core_pid']), '-o', 'pid='],
+            assert subprocess.run(['ps', '-p', str(status['core_pid']), '-o', 'pid='],
                                   capture_output=True).returncode != 0
             print('PASS detached root supervisor survives authorization exit and reaps its core on stop')
     finally:

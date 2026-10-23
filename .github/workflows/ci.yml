@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  MIHOMO_VERSION: v1.19.33
+
+jobs:
+  test:
+    name: ${{ matrix.system }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            system: macos
+            core: darwin-arm64
+            sha256: 060b64b0f2c9a310831db0fe4adb2878de67bfa606c311813c1f13966aa504b6
+          - os: ubuntu-22.04
+            system: linux
+            core: linux-amd64-compatible
+            sha256: 386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6
+          - os: windows-2022
+            system: windows
+            core: windows-amd64-compatible
+            sha256: 7aaf636a4f2172dcd8ec34ac4f52797b059195e5afd6409508c963e545f8864d
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Locate core
+        run: echo "CORE=$RUNNER_TEMP/mihomo${{ matrix.system == 'windows' && '.exe' || '' }}" >> "$GITHUB_ENV"
+
+      - name: Install Linux dependencies
+        if: matrix.system == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev xvfb dbus python3-gi
+
+      - name: Lint
+        run: |
+          rustup component add clippy rustfmt
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked -- --test-threads=1
+
+      - name: Package
+        run: |
+          ./scripts/fetch-mihomo.sh "$MIHOMO_VERSION" ${{ matrix.core }} ${{ matrix.sha256 }} "$CORE"
+          case ${{ matrix.system }} in
+            macos) ./scripts/build.sh "$CORE" ;;
+            linux) ./scripts/build-linux.sh "$CORE" ;;
+            windows) pwsh -File scripts/build-windows.ps1 -Core "$CORE" ;;
+          esac
+
+      # Real interface actions against the packaged app and core; TUN stays off.
+      - name: UI smoke test
+        run: |
+          case ${{ matrix.system }} in
+            linux)
+              xvfb-run -a dbus-run-session -- python3 scripts/ui-smoke-test.py
+              xvfb-run -a dbus-run-session -- python3 scripts/tray-smoke-test.py ;;
+            windows) python scripts/ui-smoke-test.py ;;
+            macos) python3 scripts/ui-smoke-test.py ;;
+          esac
