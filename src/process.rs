@@ -516,6 +516,9 @@ mod tests {
     }
     #[test]
     fn logged_command_reports_live_output_and_keeps_it_on_cancel_or_timeout() {
+        // The output must arrive before the timeout, and PowerShell can take seconds to
+        // start on a cold CI runner.
+        let timeout = Duration::from_secs(if cfg!(windows) { 20 } else { 3 });
         for cancel in [false, true] {
             let temporary = tempfile::tempdir().unwrap();
             let path = temporary.path().join("validation.log");
@@ -524,7 +527,7 @@ mod tests {
             let mut observed = 0;
             let result = command_logged(
                 logging_sleeper(),
-                Duration::from_secs(3),
+                timeout,
                 &cancelled,
                 &pid,
                 &path,
