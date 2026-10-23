@@ -30,6 +30,7 @@ pub struct Settings {
     pub dns_port: u16,
     pub mode: String,
     pub auto_connect: bool,
+    pub auto_update: bool,
     pub selections: BTreeMap<String, String>,
 }
 impl Default for Settings {
@@ -42,6 +43,7 @@ impl Default for Settings {
             dns_port: 15353,
             mode: "rule".into(),
             auto_connect: false,
+            auto_update: true,
             selections: BTreeMap::new(),
         }
     }

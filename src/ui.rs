@@ -2,8 +2,10 @@ use crate::{
     api::Group,
     config::{self, Settings},
     engine::{self, Emit, Event, Run},
+    update::{self, Release},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
+use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
@@ -15,6 +17,7 @@ use objc2_foundation::{
     NSArray, NSDictionary, NSDistributedNotificationCenter, NSNotification, NSObject,
     NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
+use objc2_quartz_core::kCACornerCurveContinuous;
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -29,8 +32,13 @@ use std::{
         mpsc,
     },
     thread,
+    time::{Duration, SystemTime},
 };
 
+const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+/// Settings window size, and the vertical centre of its footer buttons.
+const WINDOW: NSSize = NSSize::new(460.0, 500.0);
+const FOOTER_MIDLINE: f64 = 470.0;
 static DELEGATE: AtomicPtr<Delegate> = AtomicPtr::new(std::ptr::null_mut());
 #[derive(PartialEq, Eq)]
 enum Phase {
@@ -39,6 +47,12 @@ enum Phase {
     Running,
     Stopping,
     Failed,
+}
+enum Update {
+    Idle,
+    Checking,
+    Available(Release),
+    Downloading(Release),
 }
 #[derive(Serialize, Deserialize)]
 enum Action {
@@ -51,20 +65,32 @@ enum Action {
     Login,
     Logs,
     Data,
+    CheckUpdate,
+    InstallUpdate,
+    AutoUpdate,
     Mode(String),
     Select(String, String),
 }
 struct Window {
     native: Retained<NSWindow>,
+    /// Profile counts, parsed when the window opens and after an import, not on every render.
+    summary: Option<String>,
     profile: Retained<NSTextField>,
-    status: Retained<NSTextField>,
-    tun: Retained<NSButton>,
-    auto: Retained<NSButton>,
-    login: Retained<NSButton>,
-    login_hint: Retained<NSTextField>,
-    ports: Vec<Retained<NSTextField>>,
-    start: Retained<NSButton>,
+    stats: Retained<NSTextField>,
     import: Retained<NSButton>,
+    reveal: Retained<NSButton>,
+    tun: Retained<NSButton>,
+    tun_hint: Retained<NSTextField>,
+    ports: Vec<Retained<NSTextField>>,
+    login: Retained<NSButton>,
+    auto: Retained<NSButton>,
+    hint: Retained<NSTextField>,
+    auto_update: Retained<NSButton>,
+    update: Retained<NSButton>,
+    dot: Retained<Surface>,
+    status: Retained<NSTextField>,
+    logs: Retained<NSButton>,
+    start: Retained<NSButton>,
 }
 struct Ui {
     settings: Settings,
@@ -79,6 +105,10 @@ struct Ui {
     window: Option<Window>,
     refreshing: bool,
     operation: bool,
+    update: Update,
+    /// Version an automatic check has already offered in this launch.
+    announced: Option<String>,
+    checked: Option<SystemTime>,
     smoke_step: Option<u8>,
 }
 impl Default for Ui {
@@ -95,6 +125,9 @@ impl Default for Ui {
             window: None,
             refreshing: false,
             operation: false,
+            update: Update::Idle,
+            announced: None,
+            checked: None,
             smoke_step: std::env::args().any(|a| a == "--ui-smoke").then_some(0),
         }
     }
@@ -133,7 +166,10 @@ define_class!(
     }
     unsafe impl NSWindowDelegate for Delegate {
         #[unsafe(method(windowWillClose:))]
-        fn close_settings(&self, _notification: &NSNotification) { self.ivars().ui.borrow_mut().window = None; }
+        fn close_settings(&self, _notification: &NSNotification) { self.close_window(); }
+        /// Picks up a login item approved in System Settings while the window was in the background.
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn settings_key(&self, _notification: &NSNotification) { self.render(); }
     }
     impl Delegate {
         #[unsafe(method(menuAction:))]
@@ -154,26 +190,92 @@ define_class!(
         fn login_button(&self, _sender: &AnyObject) { if let Err(error) = self.toggle_login() { self.error(&error.to_string()); } self.render(); }
         #[unsafe(method(revealProfile:))]
         fn reveal_button(&self, _sender: &AnyObject) { open(&config::home().join("profile.yaml"), true); }
+        #[unsafe(method(openLogs:))]
+        fn logs_button(&self, _sender: &AnyObject) { if let Err(error) = self.act(Action::Logs) { self.error(&error.to_string()); } }
+        #[unsafe(method(updateClicked:))]
+        fn update_button(&self, _sender: &AnyObject) {
+            let action = update_entry(&self.ivars().ui.borrow().update).1;
+            if let Some(action) = action { if let Err(error) = self.act(action) { self.error(&error.to_string()); } }
+        }
         #[unsafe(method(showSettingsNotification:))]
         fn settings_notification(&self, _notification: &NSNotification) { self.show_settings(); }
     }
 );
 
+struct Fill {
+    color: RefCell<Retained<NSColor>>,
+    radius: f64,
+    border: bool,
+}
 define_class!(
+    /// A flat fill: the window background, a section card or the status dot. On screen it
+    /// only sets layer properties, so it owns no bitmap; drawRect: covers --snapshot.
     #[unsafe(super(NSView, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
-    struct Background;
-    unsafe impl NSObjectProtocol for Background {}
-    impl Background {
-        #[unsafe(method(isOpaque))]
-        fn opaque(&self) -> bool { true }
+    #[ivars = Fill]
+    struct Surface;
+    unsafe impl NSObjectProtocol for Surface {}
+    impl Surface {
+        #[unsafe(method(isFlipped))]
+        fn flipped(&self) -> bool { true }
+        #[unsafe(method(wantsUpdateLayer))]
+        fn wants_update_layer(&self) -> bool { true }
+        #[unsafe(method(updateLayer))]
+        fn update_layer(&self) {
+            let (Some(layer), fill) = (self.layer(), self.ivars()) else { return };
+            // Resolving CGColor here follows the current light or dark appearance.
+            layer.setBackgroundColor(Some(&fill.color.borrow().CGColor()));
+            layer.setCornerRadius(fill.radius);
+            if fill.border {
+                layer.setCornerCurve(unsafe { kCACornerCurveContinuous });
+                layer.setBorderWidth(self.hairline());
+                layer.setBorderColor(Some(&NSColor::separatorColor().CGColor()));
+            }
+        }
         #[unsafe(method(drawRect:))]
-        fn draw_background(&self, rect: NSRect) {
-            NSColor::windowBackgroundColor().setFill();
-            NSRectFill(rect);
+        fn draw(&self, _rect: NSRect) {
+            let fill = self.ivars();
+            let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                self.bounds(), fill.radius, fill.radius,
+            );
+            fill.color.borrow().setFill();
+            path.fill();
+            if fill.border {
+                NSColor::separatorColor().setStroke();
+                // The bounds clip the outer half of the stroke.
+                path.setLineWidth(self.hairline() * 2.0);
+                path.stroke();
+            }
         }
     }
 );
+impl Surface {
+    fn new(
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        color: Retained<NSColor>,
+        radius: f64,
+        border: bool,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(Fill {
+            color: RefCell::new(color),
+            radius,
+            border,
+        });
+        let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        view.setLayerContentsRedrawPolicy(NSViewLayerContentsRedrawPolicy::OnSetNeedsDisplay);
+        view
+    }
+    fn set_color(&self, color: Retained<NSColor>) {
+        *self.ivars().color.borrow_mut() = color;
+        self.setNeedsDisplay(true);
+    }
+    fn hairline(&self) -> f64 {
+        1.0 / self
+            .window()
+            .map_or(2.0, |window| window.backingScaleFactor())
+    }
+}
 
 impl Delegate {
     fn setup(&self) {
@@ -184,6 +286,7 @@ impl Delegate {
         menu.setDelegate(Some(ProtocolObject::from_ref(self)));
         item.setMenu(Some(&menu));
         self.ivars().ui.borrow_mut().status_item = Some(item);
+        self.install_main_menu();
         unsafe {
             NSDistributedNotificationCenter::defaultCenter().addObserver_selector_name_object(
                 self,
@@ -228,6 +331,9 @@ impl Delegate {
                 self.snapshot(Path::new(path));
             }
         }
+        if !arguments.iter().any(|a| a == "--snapshot") {
+            update_ticks(self.ivars().emit.clone(), Duration::from_secs(10));
+        }
         let auto_connect = self.ivars().ui.borrow().settings.auto_connect;
         if auto_connect && !arguments.iter().any(|a| a == "--no-autoconnect") {
             if let Err(error) = self.connect() {
@@ -260,70 +366,110 @@ impl Delegate {
                 ui.message
             ))));
         }
-        if let Some(window) = &ui.window {
-            let stopped = matches!(ui.phase, Phase::Stopped | Phase::Failed);
-            let login = login_status();
-            let metadata = fs::read_to_string(config::home().join("profile.yaml"))
-                .ok()
-                .and_then(|s| config::summary(&s).ok());
-            let description = metadata
-                .map(|s| {
-                    format!(
-                        "{}\n{} 个节点 · {} 个策略组 · {} 条规则",
-                        ui.settings.profile_name,
-                        s.proxies,
-                        s.groups.len(),
-                        s.rules
-                    )
-                })
-                .unwrap_or_else(|| "请导入完整的 mihomo YAML 配置".into());
+        let Some(window) = &ui.window else {
+            return;
+        };
+        let stopped = matches!(ui.phase, Phase::Stopped | Phase::Failed);
+        let login = login_status();
+        let text = |value: &str| NSString::from_str(value);
+        let imported = window.summary.is_some();
+        let name = text(if imported {
+            &ui.settings.profile_name
+        } else {
+            "尚未导入配置"
+        });
+        window.profile.setStringValue(&name);
+        // The name may be truncated.
+        window.profile.setToolTip(imported.then_some(&*name));
+        window.stats.setStringValue(&text(
             window
-                .profile
-                .setStringValue(&NSString::from_str(&description));
-            window
-                .status
-                .setStringValue(&NSString::from_str(&ui.message));
-            let color = if ui.phase == Phase::Failed {
-                NSColor::systemRedColor()
-            } else {
-                NSColor::secondaryLabelColor()
-            };
-            window.status.setTextColor(Some(&color));
-            window.tun.setState(i64::from(ui.settings.tun) as _);
-            window.tun.setEnabled(stopped);
-            window
-                .auto
-                .setState(i64::from(ui.settings.auto_connect) as _);
-            window
-                .login
-                .setState(i64::from(login == SMAppServiceStatus::Enabled) as _);
-            window.login_hint.setStringValue(&NSString::from_str(
-                if login == SMAppServiceStatus::RequiresApproval {
-                    "请在系统设置 → 通用 → 登录项中允许 FlowBar。"
-                } else {
-                    "登录自启与自动连接分别设置；TUN 连接仍需要管理员授权。"
-                },
-            ));
-            for (field, port) in window.ports.iter().zip([
-                ui.settings.proxy_port,
-                ui.settings.controller_port,
-                ui.settings.dns_port,
-            ]) {
-                if field.currentEditor().is_none() {
-                    field.setStringValue(&NSString::from_str(&port.to_string()));
-                }
-                field.setEnabled(stopped);
+                .summary
+                .as_deref()
+                .unwrap_or("导入完整的 mihomo YAML 配置后即可连接。"),
+        ));
+        window.import.setEnabled(stopped);
+        window.reveal.setEnabled(imported);
+        window.tun.setState(i64::from(ui.settings.tun) as _);
+        window.tun.setEnabled(stopped);
+        window.tun_hint.setStringValue(&text(if ui.settings.tun {
+            "接管所有应用的流量；连接时需要管理员授权。"
+        } else {
+            "只开放下方的本地 HTTP/SOCKS 端口，不修改系统代理，需在应用中手动指定。"
+        }));
+        let locked = (!stopped).then(|| text("停止连接后可修改端口。"));
+        for (field, port) in window.ports.iter().zip([
+            ui.settings.proxy_port,
+            ui.settings.controller_port,
+            ui.settings.dns_port,
+        ]) {
+            if field.currentEditor().is_none() {
+                field.setStringValue(&text(&port.to_string()));
             }
-            window.start.setTitle(&NSString::from_str(if busy {
-                "处理中…"
-            } else if ui.phase == Phase::Running {
-                "停止连接"
-            } else {
-                "启动连接"
-            }));
-            window.start.setEnabled(!busy);
-            window.import.setEnabled(stopped);
+            field.setEnabled(stopped);
+            field.setToolTip(locked.as_deref());
         }
+        window
+            .login
+            .setState(i64::from(login == SMAppServiceStatus::Enabled) as _);
+        window
+            .auto
+            .setState(i64::from(ui.settings.auto_connect) as _);
+        let approval = login == SMAppServiceStatus::RequiresApproval;
+        window.hint.setStringValue(&text(if approval {
+            "需要在「系统设置 → 通用 → 登录项」中允许 FlowBar。"
+        } else {
+            "登录自启与自动连接分别设置；使用 TUN 时，登录后自动连接仍可能弹出管理员授权。"
+        }));
+        let color = if approval {
+            NSColor::systemOrangeColor()
+        } else {
+            NSColor::secondaryLabelColor()
+        };
+        window.hint.setTextColor(Some(&color));
+        window
+            .auto_update
+            .setState(i64::from(ui.settings.auto_update) as _);
+        let (title, action) = update_entry(&ui.update);
+        window.update.setTitle(&text(&title));
+        window.update.setEnabled(action.is_some());
+        window.dot.set_color(match ui.phase {
+            Phase::Running => NSColor::systemGreenColor(),
+            Phase::Starting | Phase::Stopping => NSColor::systemOrangeColor(),
+            Phase::Failed => NSColor::systemRedColor(),
+            Phase::Stopped => NSColor::tertiaryLabelColor(),
+        });
+        let message = text(&ui.message);
+        window.status.setStringValue(&message);
+        window.status.setToolTip(Some(&message));
+        let color = if ui.phase == Phase::Failed {
+            NSColor::systemRedColor()
+        } else {
+            NSColor::labelColor()
+        };
+        window.status.setTextColor(Some(&color));
+        // Centre one or two lines of status on the footer buttons, the dot on the first line.
+        let frame = window.status.frame();
+        let height = window
+            .status
+            .sizeThatFits(NSSize::new(frame.size.width, 100.0))
+            .height
+            .clamp(16.0, 34.0);
+        let top = FOOTER_MIDLINE - height / 2.0;
+        window
+            .status
+            .setFrame(rect(frame.origin.x, top, frame.size.width, height));
+        window
+            .dot
+            .setFrameOrigin(NSPoint::new(20.0, top + height.min(17.0) / 2.0 - 4.0));
+        window.logs.setEnabled(ui.run.is_some() || ui.log.is_some());
+        window.start.setTitle(&text(if busy {
+            "处理中…"
+        } else if ui.phase == Phase::Running {
+            "停止连接"
+        } else {
+            "启动连接"
+        }));
+        window.start.setEnabled(!busy);
     }
     /// Called by menuNeedsUpdate: just before the status menu opens.
     fn fill_menu(&self, menu: &NSMenu) {
@@ -406,6 +552,16 @@ impl Delegate {
         ] {
             menu.addItem(&self.item(title, Some(action), enabled, false));
         }
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let (title, action) = update_entry(&ui.update);
+        let available = action.is_some();
+        menu.addItem(&self.item(&title, action, available, false));
+        menu.addItem(&self.item(
+            "自动检查更新",
+            Some(Action::AutoUpdate),
+            true,
+            ui.settings.auto_update,
+        ));
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         let quit = self.item("退出 FlowBar", Some(Action::Quit), true, false);
         quit.setKeyEquivalent(&NSString::from_str("q"));
@@ -512,12 +668,22 @@ impl Delegate {
                 config::private_dir(&config::home())?;
                 open(&config::home(), false);
             }
-            Action::Tun | Action::Auto => {
+            Action::CheckUpdate => self.check_update(true),
+            Action::InstallUpdate => {
+                let release = match &self.ivars().ui.borrow().update {
+                    Update::Available(release) => Some(release.clone()),
+                    _ => None,
+                };
+                if let Some(release) = release {
+                    self.offer_update(&release);
+                }
+            }
+            Action::Tun | Action::Auto | Action::AutoUpdate => {
                 let mut updated = self.ivars().ui.borrow().settings.clone();
-                if matches!(action, Action::Tun) {
-                    updated.tun = !updated.tun;
-                } else {
-                    updated.auto_connect = !updated.auto_connect;
+                match action {
+                    Action::Tun => updated.tun = !updated.tun,
+                    Action::Auto => updated.auto_connect = !updated.auto_connect,
+                    _ => updated.auto_update = !updated.auto_update,
                 }
                 updated.save()?;
                 self.ivars().ui.borrow_mut().settings = updated;
@@ -615,6 +781,8 @@ impl Delegate {
         let mut changed = false;
         let mut groups_changed = false;
         let mut errors = vec![];
+        let mut notices = vec![];
+        let (mut offer, mut staged, mut due) = (None, None, false);
         for event in events {
             let current = self.ivars().ui.borrow().run.as_ref().map(|r| r.id.clone());
             let mut error = None;
@@ -679,6 +847,45 @@ impl Delegate {
                         ui.operation = false;
                         error = Some(anyhow::anyhow!(message));
                     }
+                    Event::Update(update::Event::Due) => {
+                        handled = false;
+                        due = true;
+                    }
+                    Event::Update(update::Event::Checked(manual, result)) => {
+                        ui.update = Update::Idle;
+                        match result {
+                            Ok(Some(release)) => {
+                                ui.checked = Some(SystemTime::now());
+                                if manual || ui.announced.as_deref() != Some(release.version()) {
+                                    ui.announced = Some(release.version().into());
+                                    offer = Some(release.clone());
+                                }
+                                ui.update = Update::Available(release);
+                            }
+                            Ok(None) => {
+                                ui.checked = Some(SystemTime::now());
+                                if manual {
+                                    notices.push(format!("已是最新版本（{}）。", update::CURRENT));
+                                }
+                            }
+                            Err(message) if manual => {
+                                error = Some(anyhow::anyhow!("检查更新失败：{message}"))
+                            }
+                            // A failed automatic check retries on the next hourly tick.
+                            Err(_) => {}
+                        }
+                    }
+                    Event::Update(update::Event::Staged(result)) => {
+                        if let Update::Downloading(release) =
+                            std::mem::replace(&mut ui.update, Update::Idle)
+                        {
+                            ui.update = Update::Available(release);
+                        }
+                        match result {
+                            Ok(staging) => staged = Some(staging),
+                            Err(message) => error = Some(anyhow::anyhow!("更新失败：{message}")),
+                        }
+                    }
                     _ => handled = false,
                 }
             }
@@ -695,6 +902,18 @@ impl Delegate {
         // apply this batch's older events after newer ones.
         for error in errors {
             self.error(&error.to_string());
+        }
+        for notice in notices {
+            self.alert("FlowBar", &notice, &[]);
+        }
+        if let Some(release) = offer {
+            self.offer_update(&release);
+        }
+        if let Some(staging) = staged {
+            self.install_update(&staging);
+        }
+        if due {
+            self.update_due();
         }
         self.advance_smoke();
     }
@@ -766,13 +985,15 @@ impl Delegate {
             let ui = self.ivars().ui.borrow();
             if let Some(window) = &ui.window {
                 updated.auto_connect = window.auto.state() == 1;
+                updated.auto_update = window.auto_update.state() == 1;
                 if matches!(ui.phase, Phase::Stopped | Phase::Failed) {
                     updated.tun = window.tun.state() == 1;
                     let ports = window
                         .ports
                         .iter()
-                        .map(|f| f.stringValue().to_string().parse::<u16>())
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                        .map(|f| f.stringValue().to_string().trim().parse::<u16>())
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .context("端口须为 1024–65535 之间的整数。")?;
                     updated.proxy_port = ports[0];
                     updated.controller_port = ports[1];
                     updated.dns_port = ports[2];
@@ -803,7 +1024,11 @@ impl Delegate {
         if panel.runModal() == 1 {
             if let Some(path) = panel.URL().and_then(|url| url.path()) {
                 let settings = config::import_profile(Path::new(&path.to_string()), None)?;
-                self.ivars().ui.borrow_mut().settings = settings;
+                let mut ui = self.ivars().ui.borrow_mut();
+                ui.settings = settings;
+                if let Some(window) = &mut ui.window {
+                    window.summary = profile_summary();
+                }
             }
         }
         self.render();
@@ -833,23 +1058,52 @@ impl Delegate {
         Ok(())
     }
     fn show_settings(&self) {
-        if self.ivars().ui.borrow().window.is_none() {
+        let created = self.ivars().ui.borrow().window.is_none();
+        if created {
             self.make_window();
         }
         self.render();
-        if let Some(window) = &self.ivars().ui.borrow().window {
-            window.native.center();
-            window.native.makeKeyAndOrderFront(None);
+        // Window callbacks borrow the state, so none is held while showing it.
+        let native = self
+            .ivars()
+            .ui
+            .borrow()
+            .window
+            .as_ref()
+            .map(|w| w.native.clone());
+        if let Some(native) = native {
+            if created {
+                native.center();
+            }
+            native.makeKeyAndOrderFront(None);
+            if created {
+                // Opening the window should not start editing the first port field.
+                native.makeFirstResponder(None);
+            }
         }
         #[allow(deprecated)]
         NSApplication::sharedApplication(self.mtm()).activateIgnoringOtherApps(true);
+    }
+    fn close_window(&self) {
+        let native = self
+            .ivars()
+            .ui
+            .borrow()
+            .window
+            .as_ref()
+            .map(|w| w.native.clone());
+        // Ending editing commits a port that was typed but not confirmed with Return.
+        if let Some(native) = native {
+            native.makeFirstResponder(None);
+        }
+        self.ivars().ui.borrow_mut().window = None;
     }
     fn make_window(&self) {
         let mtm = self.mtm();
         let native = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
-                rect(0.0, 0.0, 560.0, 570.0),
+                NSRect::new(NSPoint::new(0.0, 0.0), WINDOW),
                 NSWindowStyleMask::Titled
                     | NSWindowStyleMask::Closable
                     | NSWindowStyleMask::Miniaturizable,
@@ -862,113 +1116,197 @@ impl Delegate {
             native.setReleasedWhenClosed(false);
         }
         native.setDelegate(Some(ProtocolObject::from_ref(self)));
-        let view: Retained<Background> = unsafe {
-            msg_send![Background::alloc(mtm), initWithFrame: rect(0.0, 0.0, 560.0, 570.0)]
-        };
+        native.setAutorecalculatesKeyViewLoop(true);
+        // Flipped, so the frames below run top to bottom.
+        let view = Surface::new(
+            mtm,
+            NSRect::new(NSPoint::new(0.0, 0.0), WINDOW),
+            NSColor::windowBackgroundColor(),
+            0.0,
+            false,
+        );
+        view.setWantsLayer(true);
         native.setContentView(Some(&view));
-        let title = self.label("FlowBar", 28.0, false, rect(28.0, 500.0, 500.0, 40.0));
-        title.setFont(Some(&NSFont::boldSystemFontOfSize(28.0)));
-        view.addSubview(&title);
-        view.addSubview(&self.label(
-            "Rust 原生菜单栏 · mihomo 负责分流",
-            13.0,
-            true,
-            rect(28.0, 470.0, 500.0, 24.0),
-        ));
-        let profile = self.label("", 13.0, false, rect(28.0, 410.0, 500.0, 44.0));
-        view.addSubview(&profile);
-        let import = self.button(
+        let (regular, semibold) = unsafe { (NSFontWeightRegular, NSFontWeightSemibold) };
+        let small = NSFont::systemFontOfSize(11.0);
+        let caption = NSFont::systemFontOfSize_weight(12.0, semibold);
+        let section = |title: &str, y: f64, height: f64| {
+            self.label(&view, title, &caption, true, 1, rect(34.0, y, 200.0, 16.0));
+            let fill = NSColor::labelColor().colorWithAlphaComponent(0.05);
+            view.addSubview(&Surface::new(
+                mtm,
+                rect(20.0, y + 20.0, 420.0, height),
+                fill,
+                10.0,
+                true,
+            ));
+        };
+        let add = |button: Retained<NSButton>| {
+            view.addSubview(&button);
+            button
+        };
+
+        section("配置", 16.0, 72.0);
+        let profile = self.label(
+            &view,
+            "",
+            &NSFont::systemFontOfSize_weight(13.0, semibold),
+            false,
+            1,
+            rect(34.0, 51.0, 168.0, 18.0),
+        );
+        let import = add(self.button(
             "导入 YAML…",
             sel!(importYaml:),
-            rect(22.0, 363.0, 126.0, 34.0),
-            false,
-        );
-        view.addSubview(&import);
-        view.addSubview(&self.button(
-            "查看配置文件",
-            sel!(revealProfile:),
-            rect(150.0, 363.0, 140.0, 34.0),
+            rect(204.0, 44.0, 108.0, 32.0),
             false,
         ));
-        let tun = self.button(
+        let reveal = add(self.button(
+            "在访达中显示",
+            sel!(revealProfile:),
+            rect(308.0, 44.0, 124.0, 32.0),
+            false,
+        ));
+        let stats = self.label(&view, "", &small, true, 1, rect(34.0, 78.0, 392.0, 16.0));
+
+        section("连接", 126.0, 122.0);
+        let tun = add(self.button(
             "使用 TUN 接管流量",
             sel!(optionsChanged:),
-            rect(28.0, 323.0, 480.0, 25.0),
+            rect(34.0, 158.0, 392.0, 18.0),
             true,
-        );
-        view.addSubview(&tun);
-        view.addSubview(&self.label(
-            "开启 TUN 需要管理员授权。关闭后仅提供本地 HTTP/SOCKS 代理端口。",
-            12.0,
-            true,
-            rect(28.0, 278.0, 500.0, 35.0),
         ));
+        let tun_hint = self.label(&view, "", &small, true, 2, rect(54.0, 180.0, 372.0, 28.0));
+        let digits = NSFont::monospacedDigitSystemFontOfSize_weight(13.0, regular);
         let mut ports = vec![];
-        for (index, title) in ["代理", "控制", "DNS"].iter().enumerate() {
-            let x = 28.0 + index as f64 * 160.0;
-            view.addSubview(&self.label(title, 12.0, false, rect(x, 237.0, 36.0, 24.0)));
-            let field = NSTextField::initWithFrame(
-                NSTextField::alloc(mtm),
-                rect(x + 39.0, 237.0, 82.0, 24.0),
-            );
+        for (index, title) in ["HTTP/SOCKS", "控制接口", "DNS"].iter().enumerate() {
+            let x = 34.0 + index as f64 * 135.0;
+            self.label(&view, title, &small, true, 1, rect(x, 214.0, 122.0, 14.0));
+            let field =
+                NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(x, 230.0, 122.0, 22.0));
+            field.setFont(Some(&digits));
             unsafe {
                 field.setTarget(Some(self));
                 field.setAction(Some(sel!(optionsChanged:)));
             }
+            // Tabbing or clicking away saves too, not only Return.
+            if let Some(cell) = field.cell() {
+                cell.setSendsActionOnEndEditing(true);
+            }
             view.addSubview(&field);
             ports.push(field);
         }
-        let auto = self.button(
-            "打开 FlowBar 后自动连接",
-            sel!(optionsChanged:),
-            rect(28.0, 194.0, 500.0, 25.0),
+
+        section("启动与更新", 286.0, 128.0);
+        let version = self.label(
+            &view,
+            &format!("版本 {}", update::CURRENT),
+            &small,
             true,
+            1,
+            rect(226.0, 287.0, 200.0, 16.0),
         );
-        view.addSubview(&auto);
-        let login = self.button(
+        version.setAlignment(NSTextAlignment::Right);
+        let login = add(self.button(
             "登录时打开 FlowBar",
             sel!(loginChanged:),
-            rect(28.0, 154.0, 500.0, 25.0),
+            rect(34.0, 318.0, 392.0, 18.0),
             true,
-        );
-        view.addSubview(&login);
-        let login_hint = self.label("", 11.0, true, rect(28.0, 118.0, 500.0, 28.0));
-        view.addSubview(&login_hint);
-        let status = self.label("", 12.0, true, rect(28.0, 72.0, 500.0, 36.0));
-        view.addSubview(&status);
-        let start = self.button(
-            "启动连接",
-            sel!(toggleConnection:),
-            rect(22.0, 25.0, 140.0, 36.0),
+        ));
+        let auto = add(self.button(
+            "打开 FlowBar 后自动连接",
+            sel!(optionsChanged:),
+            rect(34.0, 344.0, 392.0, 18.0),
+            true,
+        ));
+        let hint = self.label(&view, "", &small, true, 2, rect(54.0, 366.0, 372.0, 28.0));
+        let auto_update = add(self.button(
+            "自动检查更新",
+            sel!(optionsChanged:),
+            rect(34.0, 402.0, 250.0, 18.0),
+            true,
+        ));
+        let update = add(self.button(
+            "检查更新…",
+            sel!(updateClicked:),
+            rect(292.0, 395.0, 140.0, 32.0),
+            false,
+        ));
+
+        let dot = Surface::new(
+            mtm,
+            rect(20.0, FOOTER_MIDLINE - 4.0, 8.0, 8.0),
+            NSColor::tertiaryLabelColor(),
+            4.0,
             false,
         );
-        view.addSubview(&start);
+        view.addSubview(&dot);
+        // render() sets the height and position; the text stays selectable so errors can be copied.
+        let status = self.label(
+            &view,
+            "",
+            &NSFont::systemFontOfSize(12.0),
+            false,
+            2,
+            rect(34.0, FOOTER_MIDLINE - 8.0, 194.0, 16.0),
+        );
+        status.setSelectable(true);
+        let logs = add(self.button(
+            "查看日志",
+            sel!(openLogs:),
+            rect(230.0, 454.0, 94.0, 32.0),
+            false,
+        ));
+        let start = add(self.button(
+            "启动连接",
+            sel!(toggleConnection:),
+            rect(320.0, 454.0, 112.0, 32.0),
+            false,
+        ));
         self.ivars().ui.borrow_mut().window = Some(Window {
             native,
+            summary: profile_summary(),
             profile,
-            status,
-            tun,
-            auto,
-            login,
-            login_hint,
-            ports,
-            start,
+            stats,
             import,
+            reveal,
+            tun,
+            tun_hint,
+            ports,
+            login,
+            auto,
+            hint,
+            auto_update,
+            update,
+            dot,
+            status,
+            logs,
+            start,
         });
     }
     fn label(
         &self,
+        view: &NSView,
         title: &str,
-        size: f64,
+        font: &NSFont,
         secondary: bool,
+        lines: isize,
         frame: NSRect,
     ) -> Retained<NSTextField> {
         let field = NSTextField::wrappingLabelWithString(&NSString::from_str(title), self.mtm());
-        field.setFont(Some(&NSFont::systemFontOfSize(size)));
+        field.setFont(Some(font));
         field.setFrame(frame);
+        field.setSelectable(false);
+        field.setMaximumNumberOfLines(lines);
+        if lines == 1 {
+            field.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        } else if let Some(cell) = field.cell() {
+            cell.setTruncatesLastVisibleLine(true);
+        }
         if secondary {
             field.setTextColor(Some(&NSColor::secondaryLabelColor()));
         }
+        view.addSubview(&field);
         field
     }
     fn button(
@@ -998,11 +1336,146 @@ impl Delegate {
         button.setFrame(frame);
         button
     }
+    /// An accessory app has no menu bar, but its main menu still provides the standard
+    /// shortcuts: ⌘W and ⌘Q for the settings window, and editing keys in the port fields.
+    fn install_main_menu(&self) {
+        let mtm = self.mtm();
+        let bar = NSMenu::new(mtm);
+        let groups: [&[(&str, objc2::runtime::Sel, &str)]; 2] = [
+            &[
+                ("关闭窗口", sel!(performClose:), "w"),
+                ("退出 FlowBar", sel!(terminate:), "q"),
+            ],
+            &[
+                ("撤销", sel!(undo:), "z"),
+                ("重做", sel!(redo:), "Z"),
+                ("剪切", sel!(cut:), "x"),
+                ("拷贝", sel!(copy:), "c"),
+                ("粘贴", sel!(paste:), "v"),
+                ("全选", sel!(selectAll:), "a"),
+            ],
+        ];
+        for group in groups {
+            let menu = NSMenu::new(mtm);
+            for (title, action, key) in group {
+                // No target: the action goes to the key window's responder chain.
+                let item = unsafe {
+                    NSMenuItem::initWithTitle_action_keyEquivalent(
+                        NSMenuItem::alloc(mtm),
+                        &NSString::from_str(title),
+                        Some(*action),
+                        &NSString::from_str(key),
+                    )
+                };
+                menu.addItem(&item);
+            }
+            let parent = NSMenuItem::new(mtm);
+            parent.setSubmenu(Some(&menu));
+            bar.addItem(&parent);
+        }
+        NSApplication::sharedApplication(mtm).setMainMenu(Some(&bar));
+    }
+    /// Local proxy for update requests while it runs; TUN already routes them.
+    fn update_proxy(&self) -> Option<u16> {
+        let ui = self.ivars().ui.borrow();
+        ui.run
+            .as_ref()
+            .filter(|run| ui.phase == Phase::Running && !run.settings.tun)
+            .map(|run| run.settings.proxy_port)
+    }
+    fn update_due(&self) {
+        let due = {
+            let ui = self.ivars().ui.borrow();
+            ui.settings.auto_update
+                && matches!(ui.update, Update::Idle)
+                && ui.checked.is_none_or(|time| {
+                    time.elapsed()
+                        .map_or(true, |elapsed| elapsed >= UPDATE_INTERVAL)
+                })
+        };
+        if due {
+            self.check_update(false);
+        }
+    }
+    fn check_update(&self, manual: bool) {
+        let proxy = self.update_proxy();
+        {
+            let mut ui = self.ivars().ui.borrow_mut();
+            if !matches!(ui.update, Update::Idle) {
+                return;
+            }
+            ui.update = Update::Checking;
+        }
+        self.render();
+        let emit = self.ivars().emit.clone();
+        thread::spawn(move || {
+            let result = update::check(proxy).map_err(|e| format!("{e:#}"));
+            emit(Event::Update(update::Event::Checked(manual, result)));
+        });
+    }
+    fn offer_update(&self, release: &Release) {
+        let body = release.body.as_deref().unwrap_or_default().trim();
+        let mut notes: String = body.chars().take(600).collect();
+        if notes.len() < body.len() {
+            notes.push('…');
+        }
+        let choice = self.alert(
+            &format!("FlowBar {} 已发布", release.version()),
+            format!(
+                "当前版本 {}。安装时会断开连接，完成后自动重新打开 FlowBar。\n\n{notes}",
+                update::CURRENT
+            )
+            .trim_end(),
+            &["安装并重启", "稍后", "查看发布页"],
+        );
+        match choice {
+            0 => self.download_update(),
+            2 if release.html_url.starts_with("https://github.com/") => {
+                open(Path::new(&release.html_url), false)
+            }
+            _ => {}
+        }
+    }
+    fn download_update(&self) {
+        let proxy = self.update_proxy();
+        let release = {
+            let mut ui = self.ivars().ui.borrow_mut();
+            let Update::Available(release) = &ui.update else {
+                return;
+            };
+            let release = release.clone();
+            ui.update = Update::Downloading(release.clone());
+            release
+        };
+        self.render();
+        let emit = self.ivars().emit.clone();
+        thread::spawn(move || {
+            let result = update::stage(&release, proxy).map_err(|e| format!("{e:#}"));
+            emit(Event::Update(update::Event::Staged(result)));
+        });
+    }
+    fn install_update(&self, staging: &Path) {
+        match update::install(staging) {
+            // Quitting stops the connection; the relaunch waits for this process to exit.
+            Ok(()) => NSApplication::sharedApplication(self.mtm()).terminate(None),
+            Err(error) => self.error(&format!("更新失败：{error:#}")),
+        }
+    }
     fn error(&self, message: &str) {
+        self.alert("FlowBar", message, &[]);
+    }
+    /// Returns the index of the clicked button.
+    fn alert(&self, title: &str, message: &str, buttons: &[&str]) -> isize {
+        // Results of background work can arrive while another app is in front.
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(self.mtm()).activateIgnoringOtherApps(true);
         let alert = NSAlert::new(self.mtm());
-        alert.setMessageText(&NSString::from_str("FlowBar"));
+        alert.setMessageText(&NSString::from_str(title));
         alert.setInformativeText(&NSString::from_str(message));
-        alert.runModal();
+        for button in buttons {
+            alert.addButtonWithTitle(&NSString::from_str(button));
+        }
+        alert.runModal() - NSAlertFirstButtonReturn
     }
     fn snapshot(&self, path: &Path) {
         let ui = self.ivars().ui.borrow();
@@ -1025,6 +1498,38 @@ impl Delegate {
     }
 }
 
+/// Menu and settings window text for the update state, and the action it offers.
+fn update_entry(update: &Update) -> (String, Option<Action>) {
+    match update {
+        Update::Idle => ("检查更新…".into(), Some(Action::CheckUpdate)),
+        Update::Checking => ("正在检查更新…".into(), None),
+        Update::Available(release) => (
+            format!("安装更新 {}…", release.version()),
+            Some(Action::InstallUpdate),
+        ),
+        Update::Downloading(release) => (format!("正在下载 {}…", release.version()), None),
+    }
+}
+/// Emits an update tick after `delay` and then hourly from the main queue, without keeping
+/// a sleeping thread. Hourly ticks keep the daily check on time across system sleep.
+fn update_ticks(emit: Emit, delay: Duration) {
+    let when = DispatchTime::try_from(delay).unwrap_or(DispatchTime::FOREVER);
+    let _ = DispatchQueue::main().after(when, move || {
+        emit(Event::Update(update::Event::Due));
+        update_ticks(emit, Duration::from_secs(3600));
+    });
+}
+/// Counts shown in the settings window. Parsing a large profile is costly, so callers cache it.
+fn profile_summary() -> Option<String> {
+    let yaml = fs::read_to_string(config::home().join("profile.yaml")).ok()?;
+    let summary = config::summary(&yaml).ok()?;
+    Some(format!(
+        "{} 个节点 · {} 个策略组 · {} 条规则",
+        summary.proxies,
+        summary.groups.len(),
+        summary.rules
+    ))
+}
 fn group_title(group: &Group) -> String {
     format!("{} → {}", group.name, group.current)
 }

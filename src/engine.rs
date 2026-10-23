@@ -2,7 +2,7 @@ use crate::{
     api::{Api, Group},
     config::{self, Settings},
     process::{self, ManagedChild},
-    supervisor,
+    supervisor, update,
 };
 use anyhow::{Result, bail, ensure};
 use std::{
@@ -28,6 +28,7 @@ pub enum Event {
     Mode(String, String),
     Selection(String, String, String, Vec<Group>),
     Error(String),
+    Update(update::Event),
 }
 pub type Emit = Arc<dyn Fn(Event) + Send + Sync>;
 pub struct Run {

@@ -10,6 +10,7 @@
 - TUN 接管应用流量；也可关闭 TUN，仅使用本地 HTTP/SOCKS 代理。
 - 菜单栏切换规则、全局、直连模式，以及策略组和节点。
 - 原生登录自启，并可独立设置打开应用后自动连接。
+- 从 GitHub Releases 检查更新，在应用内下载、校验并替换后自动重启。
 - 退出应用或主进程意外退出时，监督进程停止内核。
 - 本地日志和配置检查，控制接口仅监听回环地址并使用随机密钥。
 
@@ -50,6 +51,30 @@ open ~/Applications/FlowBar.app
 | DNS | `127.0.0.1:15353` |
 
 端口可以在设置中修改。
+
+## 检查更新
+
+菜单或设置窗口中的「检查更新…」查询 GitHub 上最新的正式 Release。「自动检查更新」默认开启，应用打开约 10 秒后检查一次，之后每天检查一次；自动检查失败时不弹窗，下个小时重试。
+
+发现新版本后，点击「安装并重启」会把对应架构的 `FlowBar-<版本>-macos-arm64.zip` 下载到应用所在目录，然后依次校验：大小、GitHub 提供的 SHA-256、代码签名、Bundle ID 和版本号，并确认新程序能在本机运行。校验通过后原子替换当前应用，断开连接并重新打开。本地 HTTP 代理运行时，更新请求走该代理；TUN 运行时由 TUN 接管。
+
+应用需放在可写目录中（例如 `~/Applications`）。开发时直接运行的 `target/release/flowbar` 不能自我更新。命令行可用 `FlowBar.app/Contents/MacOS/FlowBar --check-update` 检查版本。
+
+签名仍是 ad hoc，安装包的可信度来自 GitHub 的 HTTPS 和 Release 本身，没有开发者身份校验。应用内下载不会带隔离标记，所以更新后不会被 Gatekeeper 拦截。但第一次用浏览器下载 Release 安装时会被拦截，可在「系统设置 → 隐私与安全性」中允许，或改用终端下载：
+
+```sh
+curl -fLO https://github.com/best-shuke/FlowBar/releases/latest/download/FlowBar-<版本>-macos-arm64.zip
+```
+
+### 发布新版本
+
+仓库须为公开，应用才能匿名读取 Release。发布步骤：
+
+1. 同时修改 `Cargo.toml` 的 `version`、`Resources/Info.plist` 的 `CFBundleShortVersionString`（并递增 `CFBundleVersion`），执行 `cargo build` 更新 `Cargo.lock`；`cargo test` 会检查前两者一致。
+2. 提交后打标签并推送：`git tag v0.3.0 && git push origin main v0.3.0`。
+3. `.github/workflows/release.yml` 在 macOS runner 上核对标签与版本、下载并校验固定版本的 mihomo（`MIHOMO_VERSION`）、运行测试、构建并发布 Release。
+
+升级内置 mihomo 时，同时修改工作流中的 `MIHOMO_VERSION` 和 `MIHOMO_SHA256`。
 
 ## 配置与数据
 
@@ -99,6 +124,6 @@ python3 scripts/privileged-smoke-test.py
 
 ## 代码结构与许可
 
-`src/ui.rs` 为原生界面，`config.rs` 处理 YAML，`engine.rs` 协调连接，`supervisor.rs` 管理内核和临时 DNS，`process.rs` 管理子进程生命周期，`api.rs` 调用 mihomo 控制接口。
+`src/ui.rs` 为原生界面，`config.rs` 处理 YAML，`engine.rs` 协调连接，`supervisor.rs` 管理内核和临时 DNS，`process.rs` 管理子进程生命周期，`api.rs` 调用 mihomo 控制接口，`update.rs` 检查和安装更新。
 
 FlowBar 源码采用 [MIT License](LICENSE)。独立的 mihomo 内核采用 GPL-3.0；构建时打包其许可和 Rust 依赖许可，详见 [第三方说明](Resources/THIRD_PARTY.md)。

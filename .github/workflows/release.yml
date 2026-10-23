@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+
+env:
+  MIHOMO_VERSION: v1.19.33
+  MIHOMO_SHA256: 060b64b0f2c9a310831db0fe4adb2878de67bfa606c311813c1f13966aa504b6
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          PLIST_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - Resources/Info.plist)"
+          if [ "$VERSION" != "$CARGO_VERSION" ] || [ "$VERSION" != "$PLIST_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME, Cargo.toml $CARGO_VERSION and Info.plist $PLIST_VERSION must match."
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Fetch mihomo
+        run: |
+          curl -fsSL -o mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/$MIHOMO_VERSION/mihomo-darwin-arm64-$MIHOMO_VERSION.gz"
+          echo "$MIHOMO_SHA256  mihomo.gz" | shasum -a 256 -c -
+          gunzip mihomo.gz
+          chmod 755 mihomo
+
+      # scripts/licenses.py reads the locked dependency sources offline.
+      - name: Test
+        run: |
+          cargo fetch --locked
+          cargo test --locked -- --test-threads=1
+
+      - name: Build
+        run: ./scripts/build.sh "$PWD/mihomo"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ASSET="FlowBar-$VERSION-macos-arm64.zip"
+          ditto -c -k --keepParent dist/FlowBar.app "$ASSET"
+          gh release create "$GITHUB_REF_NAME" "$ASSET" \
+            --title "FlowBar $VERSION" \
+            --notes "内置 mihomo $MIHOMO_VERSION（GPL-3.0，源码：https://github.com/MetaCubeX/mihomo/tree/$MIHOMO_VERSION）。" \
+            --generate-notes

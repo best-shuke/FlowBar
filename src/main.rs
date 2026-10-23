@@ -4,6 +4,7 @@ mod engine;
 mod process;
 mod supervisor;
 mod ui;
+mod update;
 
 use anyhow::{Context, Result, bail};
 use std::{
@@ -57,6 +58,10 @@ fn entry() -> Result<()> {
             config::private_write(Path::new(&arguments[2]), yaml.as_bytes())?;
             println!("运行配置已生成；TUN={}。", settings.tun);
         }
+        Some("--check-update") => match update::check(None)? {
+            Some(release) => println!("可以更新到 {}：{}", release.version(), release.html_url),
+            None => println!("已是最新版本（{}）。", update::CURRENT),
+        },
         Some("--login-status") => {
             objc2::rc::autoreleasepool(|_| println!("{:?}", ui::login_status()))
         }
