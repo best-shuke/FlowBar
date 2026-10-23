@@ -18,7 +18,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use uuid::Uuid;
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
@@ -39,41 +38,68 @@ pub struct Output {
     pub status: ExitStatus,
     pub output: Vec<u8>,
 }
+/// Runs a short command without a persistent log, for the Unix administrator launch.
+#[cfg(any(unix, test))]
 pub fn command(
-    mut command: Command,
+    command: Command,
     timeout: Duration,
     cancelled: &AtomicBool,
     pid: &AtomicU32,
 ) -> Result<Output> {
-    let path = std::env::temp_dir().join(format!("flowbar-{}.log", Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("flowbar-{}.log", uuid::Uuid::new_v4()));
+    let result = command_logged(command, timeout, cancelled, pid, &path, |_| {});
+    let _ = fs::remove_file(path);
+    result
+}
+/// Streams output to a private, persistent log, including on timeout or cancellation.
+/// `progress` sees the last 64 KiB when the log changes, on the calling worker thread.
+pub fn command_logged(
+    mut command: Command,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    pid: &AtomicU32,
+    path: &Path,
+    mut progress: impl FnMut(&[u8]),
+) -> Result<Output> {
     let mut options = fs::OpenOptions::new();
-    options.create_new(true).read(true).write(true);
+    options.create_new(true).write(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut log = options.open(&path)?;
+    let log = options.open(path)?;
+    // A cloned file shares its offset with the child. Read through a separate handle
+    // so polling never moves the child's write position.
+    let mut reader = fs::File::open(path)?;
     let result = (|| {
+        ensure!(!cancelled.load(Ordering::SeqCst), "操作已取消");
         background(&mut command)
+            .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log.try_clone()?));
         let mut child = ManagedChild::new(command.spawn()?);
         pid.store(child.0.id(), Ordering::SeqCst);
         let deadline = Instant::now() + timeout;
+        let mut length = 0;
+        let mut output = Vec::new();
         let status = loop {
-            if let Some(status) = child.0.try_wait()? {
-                break status;
+            let status = child.0.try_wait()?;
+            let current = reader.metadata()?.len();
+            if current != length || status.is_some() {
+                reader.seek(SeekFrom::Start(current.saturating_sub(65536)))?;
+                output.clear();
+                (&mut reader).take(65536).read_to_end(&mut output)?;
+                progress(&output);
+                length = current;
             }
             ensure!(!cancelled.load(Ordering::SeqCst), "操作已取消");
+            if let Some(status) = status {
+                break status;
+            }
             ensure!(Instant::now() < deadline, "操作超时，请查看日志。");
             thread::sleep(Duration::from_millis(50));
         };
-        let length = log.metadata()?.len();
-        log.seek(SeekFrom::Start(length.saturating_sub(65536)))?;
-        let mut output = Vec::new();
-        log.read_to_end(&mut output)?;
         Ok(Output { status, output })
     })();
     pid.store(0, Ordering::SeqCst);
-    let _ = fs::remove_file(path);
     result
 }
 #[cfg(any(target_os = "macos", all(test, unix)))]
@@ -467,6 +493,71 @@ mod tests {
             .is_err()
         );
         assert!(start.elapsed() < Duration::from_secs(3));
+    }
+    fn logging_sleeper() -> Command {
+        #[cfg(unix)]
+        {
+            let mut command = Command::new("/bin/sh");
+            command.args([
+                "-c",
+                "printf 'validation-started\\n'; printf 'download-pending\\n' >&2; exec /bin/sleep 30",
+            ]);
+            command
+        }
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile", "-NonInteractive", "-Command",
+                "[Console]::Out.WriteLine('validation-started'); [Console]::Error.WriteLine('download-pending'); Start-Sleep -Seconds 30",
+            ]);
+            command
+        }
+    }
+    #[test]
+    fn logged_command_reports_live_output_and_keeps_it_on_cancel_or_timeout() {
+        for cancel in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("validation.log");
+            let cancelled = AtomicBool::new(false);
+            let pid = AtomicU32::new(0);
+            let mut observed = 0;
+            let result = command_logged(
+                logging_sleeper(),
+                Duration::from_secs(3),
+                &cancelled,
+                &pid,
+                &path,
+                |output| {
+                    let text = String::from_utf8_lossy(output);
+                    if text.contains("validation-started") && text.contains("download-pending") {
+                        observed = pid.load(Ordering::SeqCst);
+                        // The callback must run while the command is still running.
+                        assert!(alive(observed));
+                        if cancel {
+                            cancelled.store(true, Ordering::SeqCst);
+                        }
+                    }
+                },
+            );
+            assert!(result.err().unwrap().to_string().contains(if cancel {
+                "取消"
+            } else {
+                "超时"
+            }));
+            assert!(observed > 1 && !alive(observed));
+            assert_eq!(pid.load(Ordering::SeqCst), 0);
+            let log = fs::read_to_string(&path).unwrap();
+            assert!(log.contains("validation-started") && log.contains("download-pending"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
     }
     #[test]
     fn parent_exit_stops_child() {

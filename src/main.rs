@@ -83,8 +83,11 @@ fn entry() -> Result<()> {
             println!("运行配置已生成；TUN={}。", settings.tun);
         }
         Some("--check-update") => match update::check(None)? {
-            Some(release) => println!("可以更新到 {}：{}", release.version(), release.html_url),
-            None => println!("已是最新版本（{}）。", update::CURRENT),
+            update::Check::Available(release) => {
+                println!("可以更新到 {}：{}", release.version(), release.html_url)
+            }
+            update::Check::Current => println!("已是最新版本（{}）。", update::CURRENT),
+            update::Check::Unavailable => bail!(update::UNAVAILABLE),
         },
         Some("--login-status") => println!("{:?}", ui::login_status()),
         Some("--engine-smoke") => engine_smoke()?,

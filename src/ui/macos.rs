@@ -467,7 +467,7 @@ impl Delegate {
     }
     /// Called by menuNeedsUpdate: just before the status menu opens.
     fn fill_menu(&self, menu: &NSMenu) {
-        let entries = self.ivars().app.menu();
+        let entries = self.ivars().app.menu(login_status());
         menu.removeAllItems();
         let mut groups_menu = None;
         self.add_entries(menu, entries, &mut groups_menu);

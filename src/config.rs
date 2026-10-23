@@ -30,6 +30,7 @@ pub const GEO_NAMES: &[&str] = &[
     "GeoIP.dat",
     "GeoSite.dat",
     "geoip.metadb",
+    "geoip.db",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -311,6 +312,85 @@ pub fn seed_geo(source: &Path, destination: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// A preflight hint for inline rules and DNS. Providers are loaded by mihomo itself;
+/// its live log remains authoritative for downloads and invalid databases.
+pub fn missing_geo(yaml: &str, data: &Path) -> Result<Vec<&'static str>> {
+    fn rule_uses(value: &Value, kinds: &[&str]) -> bool {
+        match value {
+            Value::String(rule) => rule.split(['(', ')']).any(|part| {
+                let mut fields = part.split(',').map(str::trim);
+                let kind = fields.next().unwrap_or_default();
+                kinds.contains(&kind)
+                    && !(kind.ends_with("GEOIP")
+                        && fields.next().is_some_and(|s| s.eq_ignore_ascii_case("lan")))
+            }),
+            Value::Sequence(values) => values.iter().any(|v| rule_uses(v, kinds)),
+            Value::Mapping(values) => values.values().any(|v| rule_uses(v, kinds)),
+            _ => false,
+        }
+    }
+    fn geosite_dns(value: &Value) -> bool {
+        match value {
+            Value::String(s) => s.starts_with("geosite:"),
+            Value::Sequence(values) => values.iter().any(geosite_dns),
+            Value::Mapping(values) => values
+                .iter()
+                .any(|(key, value)| geosite_dns(key) || geosite_dns(value)),
+            _ => false,
+        }
+    }
+    let root = parse(yaml)?;
+    let uses =
+        |kinds: &[&str]| rule_uses(&root["rules"], kinds) || rule_uses(&root["sub-rules"], kinds);
+    let dns = &root["dns"];
+    let fallback = dns["fallback"].as_sequence().is_some_and(|v| !v.is_empty());
+    let filter = &dns["fallback-filter"];
+    let ip = uses(&["GEOIP", "SRC-GEOIP"])
+        || (fallback
+            && filter["geoip"].as_bool() != Some(false)
+            && !filter["geoip-code"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("lan")));
+    let site = uses(&["GEOSITE"])
+        || geosite_dns(dns)
+        || (fallback
+            && filter["geosite"]
+                .as_sequence()
+                .is_some_and(|v| !v.is_empty()));
+    let dat = root["geodata-mode"].as_bool() == Some(true);
+    let candidates: &[(&str, &[&str], bool)] = &[
+        (
+            if dat {
+                "GeoIP.dat"
+            } else {
+                "Country.mmdb / geoip.metadb"
+            },
+            if dat {
+                &["GeoIP.dat"]
+            } else {
+                &["Country.mmdb", "geoip.metadb", "geoip.db"]
+            },
+            ip,
+        ),
+        ("GeoSite.dat", &["GeoSite.dat"], site),
+        ("ASN.mmdb", &["ASN.mmdb"], uses(&["IP-ASN", "SRC-IP-ASN"])),
+    ];
+    let files: Vec<_> = fs::read_dir(data)?
+        .flatten()
+        .filter(|e| e.metadata().is_ok_and(|m| m.is_file() && m.len() > 0))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    Ok(candidates
+        .iter()
+        .filter(|(_, names, needed)| {
+            *needed
+                && !files
+                    .iter()
+                    .any(|f| names.iter().any(|n| f.eq_ignore_ascii_case(n)))
+        })
+        .map(|(name, _, _)| *name)
+        .collect())
+}
 pub fn copy_providers(yaml: &str, source: &Path, destination: &Path) -> Result<()> {
     let root = parse(yaml)?;
     for kind in ["proxy-providers", "rule-providers"] {
@@ -380,6 +460,57 @@ pub fn import_profile(source: &Path, name: Option<&str>) -> Result<Settings> {
 mod tests {
     use super::*;
     const FIXTURE: &str = "proxies:\n  - &node\n    name: 香港 / 01\n    password: '00123: on # keep'\n    server: example.com\n  - <<: *node\n    name: 东京\nproxy-groups:\n  - name: 代理\n    type: select\n    proxies: [香港 / 01, 东京]\nrules: [DOMAIN,example.com,代理]\ntun:\n  enable: true\n  stack: gvisor\n  route-exclude-address: [192.168.1.0/24]\ndns:\n  nameserver: [https://dns.alidns.com/dns-query]\n";
+    #[test]
+    fn preflights_geo_rules_modes_aliases_and_dns() {
+        let data = tempfile::tempdir().unwrap();
+        let missing = |yaml: &str| missing_geo(yaml, data.path()).unwrap();
+        let yaml =
+            "proxies: []\nrules: ['GEOIP,CN,DIRECT', 'GEOSITE,cn,DIRECT', 'IP-ASN,123,DIRECT']\n";
+        assert_eq!(
+            missing(yaml),
+            ["Country.mmdb / geoip.metadb", "GeoSite.dat", "ASN.mmdb"]
+        );
+        // mihomo accepts these names without regard to case, including legacy MMDB aliases.
+        fs::write(data.path().join("geoip.db"), b"database").unwrap();
+        fs::write(data.path().join("geosite.dat"), b"database").unwrap();
+        fs::write(data.path().join("asn.mmdb"), b"database").unwrap();
+        assert!(missing(yaml).is_empty());
+        assert_eq!(
+            missing(&format!("{yaml}geodata-mode: true\n")),
+            ["GeoIP.dat"]
+        );
+        fs::write(data.path().join("geoip.dat"), []).unwrap();
+        assert_eq!(
+            missing(&format!("{yaml}geodata-mode: true\n")),
+            ["GeoIP.dat"]
+        );
+        fs::write(data.path().join("geoip.dat"), b"database").unwrap();
+        assert!(missing(&format!("{yaml}geodata-mode: true\n")).is_empty());
+
+        let empty = tempfile::tempdir().unwrap();
+        let check = |yaml: &str| missing_geo(yaml, empty.path()).unwrap();
+        assert!(check("proxies: []\nrules: ['GEOIP,LAN,DIRECT', 'MATCH,DIRECT']").is_empty());
+        assert_eq!(
+            check("proxies: []\nsub-rules:\n  cn: ['AND,((NETWORK,TCP),(SRC-GEOIP,CN)),DIRECT']"),
+            ["Country.mmdb / geoip.metadb"]
+        );
+        assert_eq!(
+            check("proxies: []\ndns:\n  nameserver-policy: {'geosite:cn': '223.5.5.5'}"),
+            ["GeoSite.dat"]
+        );
+        assert_eq!(
+            check(
+                "proxies: []\ndns:\n  fallback: [1.1.1.1]\n  fallback-filter:\n    geosite: [cn]"
+            ),
+            ["Country.mmdb / geoip.metadb", "GeoSite.dat"]
+        );
+        assert!(
+            check("proxies: []\ndns:\n  fallback: [1.1.1.1]\n  fallback-filter: {geoip: false}")
+                .is_empty()
+        );
+        // Node credentials and names never imply a database dependency.
+        assert!(check("proxies: [{name: 'GEOSITE,cn,DIRECT', password: 'geosite:cn'}]").is_empty());
+    }
     #[test]
     fn preserves_merged_nodes_credentials_rules_and_dns() {
         let original = parse(FIXTURE).unwrap();
@@ -466,10 +597,10 @@ mod tests {
     #[test]
     fn settings_read_legacy_swift_camel_case() {
         let settings: Settings = serde_json::from_str(
-            r#"{"profileName":"zgo-or","autoConnect":true,"proxyPort":17891}"#,
+            r#"{"profileName":"my-profile","autoConnect":true,"proxyPort":17891}"#,
         )
         .unwrap();
-        assert_eq!(settings.profile_name, "zgo-or");
+        assert_eq!(settings.profile_name, "my-profile");
         assert!(settings.auto_connect);
         assert_eq!(settings.proxy_port, 17891);
         assert!(settings.tun);

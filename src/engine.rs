@@ -7,7 +7,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         Arc,
@@ -161,6 +161,16 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
     config::private_dir(&data)?;
     let core = supervisor::core()?;
     ensure!(core.is_file(), "应用中缺少 mihomo 内核，请重新打包。");
+    let missing = config::missing_geo(&runtime, &data)?;
+    if !missing.is_empty() {
+        emit(Event::Progress(
+            run.id.clone(),
+            format!(
+                "缺少地理数据库（{}），配置检查时将尝试下载…",
+                missing.join("、")
+            ),
+        ));
+    }
     let mut validate = Command::new(&core);
     process::clean_env(&mut validate)
         .arg("-t")
@@ -173,16 +183,36 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
     if let Some(home) = std::env::var_os("HOME") {
         validate.env("HOME", home);
     }
-    let output = process::command(
+    let log = run.stage.join("validation.log");
+    let mut progress = None;
+    let output = process::command_logged(
         validate,
         Duration::from_secs(60),
         &run.cancelled,
         &run.command_pid,
-    )?;
-    config::private_write(&run.stage.join("validation.log"), &output.output)?;
+        &log,
+        |output| {
+            if let Some(message) = validation_progress(&String::from_utf8_lossy(output)) {
+                if progress.as_ref() != Some(&message) {
+                    emit(Event::Progress(run.id.clone(), message.clone()));
+                    progress = Some(message);
+                }
+            }
+        },
+    )
+    .map_err(|error| {
+        let contents = fs::read_to_string(&log).unwrap_or_default();
+        let message = validation_error(&contents, &data, &format!("配置检查未完成：{error}"));
+        error.context(message)
+    })?;
     ensure!(
         output.status.success(),
-        "配置检查失败，请打开日志查看原因。"
+        "{}",
+        validation_error(
+            &String::from_utf8_lossy(&output.output),
+            &data,
+            "配置检查失败"
+        )
     );
     ensure!(!run.cancelled.load(Ordering::SeqCst), "操作已取消");
     let mut helper = None;
@@ -252,6 +282,59 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
             ensure!(helper.0.try_wait()?.is_none(), "内核监督进程已退出。");
         }
         thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// mihomo logs the actual resource even when a provider or DNS triggers the download.
+fn validation_progress(log: &str) -> Option<String> {
+    for line in log.lines().rev() {
+        let line = line.to_ascii_lowercase();
+        let name = if line.contains("geosite.dat") {
+            "GeoSite.dat"
+        } else if line.contains("geoip.dat") {
+            "GeoIP.dat"
+        } else if line.contains("asn.mmdb") {
+            "ASN.mmdb"
+        } else if line.contains("mmdb") {
+            "Country.mmdb / geoip.metadb"
+        } else {
+            continue;
+        };
+        if line.contains("start download") || line.contains("invalid, remove and download") {
+            return Some(format!("正在下载地理数据库（{name}）…"));
+        }
+        if line.contains("download") && line.contains("finish") {
+            return Some("地理数据库下载完成，正在继续检查配置…".into());
+        }
+    }
+    None
+}
+fn validation_error(log: &str, data: &Path, fallback: &str) -> String {
+    let lower = log.to_ascii_lowercase();
+    let geo_error = lower.lines().any(|line| {
+        ["mmdb", "geoip", "geosite", "asn.mmdb"]
+            .iter()
+            .any(|name| line.contains(name))
+            && [
+                "can't download",
+                "can't initial",
+                "can't load",
+                "can't remove invalid",
+            ]
+            .iter()
+            .any(|marker| line.contains(marker))
+    });
+    let interrupted_download = fallback.starts_with("配置检查未完成")
+        && validation_progress(log).is_some_and(|message| message.starts_with("正在下载"));
+    if geo_error || interrupted_download {
+        format!(
+            "地理数据库加载或下载未能完成。\n\n{fallback}。请确认可访问配置中的 geox-url 下载源，\
+             或将所需的 Country.mmdb / geoip.metadb、GeoIP.dat、GeoSite.dat 或 ASN.mmdb 复制到 {} 后重试。\
+             文件类型须与配置一致；也可将数据库放在 YAML 同目录后重新导入。详情见 validation.log。",
+            data.display()
+        )
+    } else {
+        format!("{fallback}，请打开日志查看原因。")
     }
 }
 
@@ -418,4 +501,49 @@ fn verge_running() -> Result<bool> {
         more = unsafe { Process32NextW(handle, &mut entry) } != 0;
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn reports_downloads_and_distinguishes_geo_errors_from_other_config_errors() {
+        let pending = r#"level=info msg="Can't find MMDB, start download""#;
+        assert!(
+            validation_progress(pending)
+                .unwrap()
+                .contains("Country.mmdb")
+        );
+        let finished = format!("{pending}\nlevel=info msg=\"Download MMDB finish\"");
+        assert!(validation_progress(&finished).unwrap().contains("下载完成"));
+        let retry = "GeoSite.dat invalid, remove and download: invalid database";
+        assert!(validation_progress(retry).unwrap().contains("GeoSite.dat"));
+        let data = Path::new("local-data").join("Data");
+        let error = validation_error(
+            "can't download MMDB: connection refused",
+            &data,
+            "配置检查失败",
+        );
+        assert!(error.contains("geox-url") && error.contains(&data.display().to_string()));
+        assert!(error.contains("重新导入"));
+        let timeout = validation_error(pending, &data, "配置检查未完成：操作超时");
+        assert!(timeout.contains("地理数据库") && timeout.contains("超时"));
+        assert_eq!(
+            validation_error(
+                "rules[0] [GEOIP,CN,missing] error: proxy [missing] not found",
+                &data,
+                "配置检查失败"
+            ),
+            "配置检查失败，请打开日志查看原因。"
+        );
+        assert_eq!(
+            validation_error(
+                &format!("{finished}\nrules[0] error: proxy [missing] not found"),
+                &data,
+                "配置检查失败"
+            ),
+            "配置检查失败，请打开日志查看原因。"
+        );
+    }
 }

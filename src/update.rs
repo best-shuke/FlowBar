@@ -32,9 +32,20 @@ const RELAUNCH: &str = r#"i=0; while kill -0 "$1" 2>/dev/null && [ $i -lt 600 ];
 #[derive(Debug)]
 pub enum Event {
     Due,
-    Checked(bool, Result<Option<Release>, String>),
+    Checked(bool, Result<Check, String>),
     Staged(Result<PathBuf, String>),
 }
+#[derive(Debug)]
+pub enum Check {
+    Current,
+    Available(Release),
+    /// Anonymous GitHub requests cannot distinguish private repos from missing releases.
+    Unavailable,
+}
+pub const UNAVAILABLE: &str = "更新源不可用（GitHub HTTP 404）：仓库不可公开访问，或尚无正式 Release。\
+    内置更新仅支持公开仓库的正式 Release，不支持私有仓库认证，也不会使用 Git 的 SSH 权限。\
+    私有部署请手动拉取源码并重新构建；如需内置更新，请公开仓库并发布对应平台的安装包。\
+    可关闭「自动检查更新」。这不影响代理连接。";
 #[derive(Clone, Debug, Deserialize)]
 pub struct Release {
     tag_name: String,
@@ -59,7 +70,7 @@ impl Release {
 }
 
 /// The newest published release when it is newer than this build.
-pub fn check(proxy: Option<u16>) -> Result<Option<Release>> {
+pub fn check(proxy: Option<u16>) -> Result<Check> {
     let repository = env!("CARGO_PKG_REPOSITORY").trim_start_matches("https://github.com/");
     let (status, body) = curl(
         &format!("https://api.github.com/repos/{repository}/releases/latest"),
@@ -71,19 +82,26 @@ pub fn check(proxy: Option<u16>) -> Result<Option<Release>> {
             "Accept: application/vnd.github+json",
         ],
     )?;
+    parse_check(status, &body)
+}
+fn parse_check(status: u16, body: &[u8]) -> Result<Check> {
     match status {
         200 => {}
-        404 => bail!("GitHub 上还没有正式发布的版本，或仓库不是公开的。"),
+        404 => return Ok(Check::Unavailable),
         403 | 429 => bail!("GitHub 请求过于频繁，请稍后再试。"),
         _ => bail!("GitHub 返回 HTTP {status}"),
     }
-    let release: Release = serde_json::from_slice(&body).context("GitHub 版本信息无效")?;
+    let release: Release = serde_json::from_slice(body).context("GitHub 版本信息无效")?;
     ensure!(
         parse_version(release.version()).is_some(),
         "无法识别版本号：{}",
         release.tag_name
     );
-    Ok(newer(release.version(), CURRENT).then_some(release))
+    Ok(if newer(release.version(), CURRENT) {
+        Check::Available(release)
+    } else {
+        Check::Current
+    })
 }
 
 /// Downloads and verifies the release next to the running bundle, so `install` can swap it in.
@@ -536,6 +554,30 @@ fn newer(candidate: &str, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn separates_unavailable_update_sources_from_network_and_release_errors() {
+        assert!(matches!(
+            parse_check(404, b"{} ").unwrap(),
+            Check::Unavailable
+        ));
+        assert!(parse_check(403, b"{}").is_err());
+        assert!(parse_check(429, b"{}").is_err());
+        assert!(parse_check(500, b"{}").is_err());
+        assert!(parse_check(200, b"not json").is_err());
+        let current = format!(r#"{{"tag_name":"v{CURRENT}","html_url":"https://github.com/x/y"}}"#);
+        assert!(matches!(
+            parse_check(200, current.as_bytes()).unwrap(),
+            Check::Current
+        ));
+        assert!(matches!(
+            parse_check(
+                200,
+                br#"{"tag_name":"v999.0.0","html_url":"https://github.com/x/y"}"#
+            )
+            .unwrap(),
+            Check::Available(_)
+        ));
+    }
     #[test]
     fn compares_versions() {
         assert!(newer("v0.3.0", "0.2.1"));

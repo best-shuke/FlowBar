@@ -56,6 +56,8 @@ struct Linux {
     application: gtk::Application,
     /// Missing when the desktop has no StatusNotifierItem host; closing the window then quits.
     tray: RefCell<Option<ksni::blocking::Handle<Tray>>>,
+    /// The model last sent to the tray; each update resends the whole menu over D-Bus.
+    shown: RefCell<Model>,
     window: RefCell<Option<Window>>,
     /// Set while render() updates widgets, whose change signals must then not act.
     rendering: Cell<bool>,
@@ -89,6 +91,7 @@ impl Shell for Linux {
         let Some(window) = self.window.borrow().clone() else {
             return;
         };
+        let reset_ports = self.app.take_reset_ports();
         self.rendering.set(true);
         window.profile.set_text(&view.profile);
         window
@@ -105,7 +108,7 @@ impl Shell for Linux {
             let editing = focus
                 .as_ref()
                 .is_some_and(|widget| widget.is_ancestor(entry));
-            if view.reset_ports || !editing {
+            if reset_ports || !editing {
                 entry.set_text(&port.to_string());
             }
             entry.set_sensitive(view.editable);
@@ -238,6 +241,10 @@ impl Shell for Linux {
         main_loop.run();
         choice.get()
     }
+    /// The tray thread holds its own copy of the menu, so it needs the new groups too.
+    fn groups_changed(&self) {
+        self.update_tray(&self.app.view());
+    }
     fn schedule_updates(&self) {
         let emit = self.app.emit.clone();
         glib::timeout_add_seconds_local_once(10, move || {
@@ -283,6 +290,7 @@ impl Linux {
             }),
             application,
             tray: RefCell::new(None),
+            shown: RefCell::new(Model::default()),
             window: RefCell::new(None),
             rendering: Cell::new(false),
         }
@@ -331,8 +339,13 @@ impl Linux {
         let model = Model {
             tooltip: format!("FlowBar · {}", view.message),
             running: view.phase == Phase::Running,
-            entries: self.app.menu(),
+            entries: self.app.menu(view.login),
         };
+        // Updating blocks on the tray thread, so only changes are sent.
+        if *self.shown.borrow() == model {
+            return;
+        }
+        *self.shown.borrow_mut() = model.clone();
         handle.update(move |tray| tray.model = model);
     }
     fn make_window(&self) -> Window {
@@ -533,7 +546,7 @@ fn check(title: &str, login: bool) -> gtk::CheckButton {
     check
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq)]
 struct Model {
     tooltip: String,
     running: bool,
@@ -715,11 +728,17 @@ pub fn login_status() -> Login {
         Login::Disabled
     }
 }
+/// Whether a FlowBar autostart entry exists, also one that starts another copy.
+pub fn login_entry() -> bool {
+    fs::symlink_metadata(autostart()).is_ok()
+}
+pub fn remove_login() -> Result<()> {
+    fs::remove_file(autostart()).context("无法移除自启动项")
+}
 pub fn toggle_login() -> Result<()> {
     let path = autostart();
     if login_status() == Login::Enabled {
-        fs::remove_file(&path).context("无法移除自启动项")?;
-        return Ok(());
+        return remove_login();
     }
     let entry = format!(
         "[Desktop Entry]\nType=Application\nName=FlowBar\nComment=mihomo 代理托盘\n{}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",

@@ -28,7 +28,7 @@ use windows_sys::Win32::{
         Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx},
         LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
         Registry::{
-            HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
+            HKEY_CURRENT_USER, REG_SZ, RRF_RT_ANY, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
             RegSetKeyValueW,
         },
         Threading::CreateMutexW,
@@ -290,6 +290,7 @@ impl Shell for Win {
         let Some(hwnd) = self.settings_hwnd() else {
             return;
         };
+        let reset_ports = self.app.take_reset_ports();
         let item = |id| unsafe { GetDlgItem(hwnd, id) };
         set_text(item(PROFILE), &view.profile);
         set_text(item(STATS), &view.stats);
@@ -301,7 +302,7 @@ impl Shell for Win {
         let focus = unsafe { GetFocus() };
         for (id, port) in PORTS.into_iter().zip(view.ports) {
             let field = item(id);
-            if view.reset_ports || focus != field {
+            if reset_ports || focus != field {
                 set_text(field, &port.to_string());
             }
             enable(field, view.editable);
@@ -527,7 +528,7 @@ impl Win {
             groups: null_mut(),
         };
         let menu = unsafe { CreatePopupMenu() };
-        for entry in self.app.menu() {
+        for entry in self.app.menu(login_status()) {
             append(menu, &entry, &mut popup);
         }
         *self.popup.borrow_mut() = Some(popup);
@@ -1259,22 +1260,46 @@ pub fn login_status() -> Login {
         Login::Disabled
     }
 }
-pub fn toggle_login() -> Result<()> {
+/// Whether a FlowBar Run entry exists, also one that starts another copy.
+pub fn login_entry() -> bool {
     let (key, name) = (wide(RUN_KEY), wide("FlowBar"));
-    let status = if login_status() == Login::Enabled {
-        unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) }
-    } else {
-        let value = wide(command_line().unwrap_or_default());
-        unsafe {
-            RegSetKeyValueW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                name.as_ptr(),
-                REG_SZ,
-                value.as_ptr().cast(),
-                (value.len() * 2) as u32,
-            )
-        }
+    unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_ANY,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+        ) == 0
+    }
+}
+pub fn remove_login() -> Result<()> {
+    let (key, name) = (wide(RUN_KEY), wide("FlowBar"));
+    let status = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) };
+    ensure!(
+        status == 0,
+        "无法移除登录项：{}",
+        std::io::Error::from_raw_os_error(status as i32)
+    );
+    Ok(())
+}
+pub fn toggle_login() -> Result<()> {
+    if login_status() == Login::Enabled {
+        return remove_login();
+    }
+    let (key, name) = (wide(RUN_KEY), wide("FlowBar"));
+    let value = wide(command_line().unwrap_or_default());
+    let status = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            REG_SZ,
+            value.as_ptr().cast(),
+            (value.len() * 2) as u32,
+        )
     };
     ensure!(
         status == 0,

@@ -44,6 +44,7 @@ pub const ARGUMENTS: &[&str] = &[
     "--snapshot",
     "--no-autoconnect",
     "--ui-smoke",
+    "--autostart",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,11 +57,12 @@ pub enum Phase {
 }
 pub enum Update {
     Idle,
+    Unavailable,
     Checking,
     Available(Release),
     Downloading(Release),
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Action {
     Connect,
     Settings,
@@ -91,7 +93,7 @@ pub fn login_status() -> Login {
 
 /// A status menu entry. Items with `checked: None` are plain commands; the others show
 /// whether an option or a choice is selected.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
     Item {
         title: String,
@@ -129,9 +131,6 @@ pub struct View {
     pub ports: [u16; 3],
     #[cfg_attr(windows, allow(dead_code))]
     pub ports_hint: Option<&'static str>,
-    /// Overwrite port fields even while one is being edited, after a failed save.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    pub reset_ports: bool,
     pub login: Login,
     pub auto_connect: bool,
     pub login_hint: &'static str,
@@ -167,7 +166,8 @@ pub trait Shell {
     /// Shows a modal message and returns the index of the clicked button; without
     /// buttons it offers a single OK. A dismissed alert returns `buttons.len()`.
     fn alert(&self, title: &str, message: &str, buttons: &[&str]) -> usize;
-    /// The groups changed while the status menu may be open.
+    /// The groups changed while the status menu may be open; the status item's menu
+    /// shows them, but the settings window does not.
     fn groups_changed(&self) {}
     /// Sends [`update::Event::Due`] after ten seconds and then hourly.
     fn schedule_updates(&self);
@@ -218,6 +218,7 @@ pub struct App {
     pub emit: Emit,
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     committing: Cell<bool>,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     reset_ports: Cell<bool>,
 }
 impl App {
@@ -298,6 +299,12 @@ impl App {
     /// Reloads the profile counts shown in a newly opened settings window.
     pub fn load_summary(&self) {
         self.ui.borrow_mut().summary = profile_summary();
+    }
+    /// Whether the settings window should overwrite its port fields even while one is being
+    /// edited, after a failed save. Only that window's render may take it.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn take_reset_ports(&self) -> bool {
+        self.reset_ports.take()
     }
 
     /// Runs an action and shows its error, if any.
@@ -474,7 +481,14 @@ impl App {
                         ui.refreshing = false;
                         ui.operation = false;
                         ui.phase = Phase::Failed;
-                        ui.message = message;
+                        // Keep the tray menu and two-line footer short; recovery steps
+                        // and paths belong in a dialog and the saved error log.
+                        if let Some((summary, _)) = message.split_once('\n') {
+                            ui.message = summary.into();
+                            notices.push(message);
+                        } else {
+                            ui.message = message;
+                        }
                     }
                     Event::Groups(id, groups) if current.as_deref() == Some(&id) => {
                         ui.refreshing = false;
@@ -509,7 +523,7 @@ impl App {
                     Event::Update(update::Event::Checked(manual, result)) => {
                         ui.update = Update::Idle;
                         match result {
-                            Ok(Some(release)) => {
+                            Ok(update::Check::Available(release)) => {
                                 ui.checked = Some(SystemTime::now());
                                 if manual || ui.announced.as_deref() != Some(release.version()) {
                                     ui.announced = Some(release.version().into());
@@ -517,10 +531,16 @@ impl App {
                                 }
                                 ui.update = Update::Available(release);
                             }
-                            Ok(None) => {
+                            Ok(update::Check::Current) => {
                                 ui.checked = Some(SystemTime::now());
                                 if manual {
                                     notices.push(format!("已是最新版本（{}）。", update::CURRENT));
+                                }
+                            }
+                            Ok(update::Check::Unavailable) => {
+                                ui.update = Update::Unavailable;
+                                if manual {
+                                    notices.push(update::UNAVAILABLE.into());
                                 }
                             }
                             Err(message) if manual => {
@@ -701,7 +721,7 @@ impl App {
         let proxy = self.update_proxy();
         {
             let mut ui = self.ui.borrow_mut();
-            if !matches!(ui.update, Update::Idle) {
+            if !matches!(ui.update, Update::Idle | Update::Unavailable) {
                 return;
             }
             ui.update = Update::Checking;
@@ -765,8 +785,9 @@ impl App {
         shell.alert("FlowBar", message, &[]);
     }
 
-    /// The status menu, built just before it opens.
-    pub fn menu(&self) -> Vec<Entry> {
+    /// The status menu, built just before it opens. Reading the login item touches the
+    /// disk, so callers that also build a [`View`] pass its value.
+    pub fn menu(&self, login: Login) -> Vec<Entry> {
         let ui = self.ui.borrow();
         let busy = matches!(ui.phase, Phase::Starting | Phase::Stopping);
         let enabled = !busy && !ui.operation;
@@ -812,7 +833,6 @@ impl App {
                 groups: true,
             });
         }
-        let login = sys::login_status();
         let (title, action) = update_entry(&ui.update);
         let available = action.is_some();
         entries.extend([
@@ -893,7 +913,6 @@ impl App {
                 ui.settings.dns_port,
             ],
             ports_hint: (!stopped).then_some("停止连接后可修改端口。"),
-            reset_ports: self.reset_ports.take(),
             login,
             auto_connect: ui.settings.auto_connect,
             login_hint: if login == Login::RequiresApproval {
@@ -955,6 +974,7 @@ pub fn selectable(group: &Group) -> bool {
 fn update_entry(update: &Update) -> (String, Option<Action>) {
     match update {
         Update::Idle => ("检查更新…".into(), Some(Action::CheckUpdate)),
+        Update::Unavailable => ("更新源不可用，重试…".into(), Some(Action::CheckUpdate)),
         Update::Checking => ("正在检查更新…".into(), None),
         Update::Available(release) => (
             format!("安装更新 {}…", release.version()),
@@ -982,7 +1002,17 @@ fn login_roundtrip() -> Result<()> {
 }
 #[cfg(not(target_os = "macos"))]
 fn login_roundtrip() -> Result<()> {
-    ensure!(login_status() == Login::Disabled, "测试登录项已存在");
+    // Every FlowBar copy shares one entry, and the Windows registry is not isolated.
+    ensure!(!sys::login_entry(), "已有 FlowBar 登录项，测试不会覆盖它");
+    struct Remove;
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            if sys::login_entry() {
+                let _ = sys::remove_login();
+            }
+        }
+    }
+    let _cleanup = Remove;
     sys::toggle_login()?;
     let registered = login_status();
     sys::toggle_login()?;
