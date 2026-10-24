@@ -412,7 +412,7 @@ fn verify(new: &Path, app: &Path, version: &str) -> Result<()> {
         new.join("Contents/Resources")
             .join(supervisor::CORE)
             .is_file(),
-        "安装包中缺少 mihomo 内核。"
+        "安装包中缺少 rill 内核。"
     );
     verify_runs(new, version)
 }
@@ -424,7 +424,7 @@ fn verify(new: &Path, _app: &Path, version: &str) -> Result<()> {
     );
     ensure!(
         new.join(supervisor::CORE).is_file(),
-        "安装包中缺少 mihomo 内核。"
+        "安装包中缺少 rill 内核。"
     );
     verify_runs(new, version)
 }

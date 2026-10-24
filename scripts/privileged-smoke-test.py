@@ -117,10 +117,10 @@ rules: ["MATCH,DIRECT"]
         if session.exists():
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
-                if not (session / 'mihomo').exists() and not (session / 'config.yaml').exists():
+                if not (session / 'rill').exists() and not (session / 'config.yaml').exists():
                     break
                 time.sleep(.1)
-            assert not (session / 'mihomo').exists(), 'Root supervisor has not cleaned up'
+            assert not (session / 'rill').exists(), 'Root supervisor has not cleaned up'
             assert not (session / 'config.yaml').exists(), 'Root config has not been removed'
         shutil.rmtree(stage)
 

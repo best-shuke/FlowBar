@@ -1,6 +1,6 @@
 # FlowBar
 
-一个常驻菜单栏 / 托盘的 [mihomo](https://github.com/MetaCubeX/mihomo) 客户端，用 Rust 和系统原生界面写成，支持 macOS、Windows 和 Linux。
+一个常驻菜单栏 / 托盘的代理客户端，用 Rust 和系统原生界面写成，支持 macOS、Windows 和 Linux。内核是 [rill](https://github.com/best-shuke/rill)：Rust 写的、与 [mihomo](https://github.com/MetaCubeX/mihomo) 配置兼容的代理内核。
 
 [下载](https://github.com/best-shuke/FlowBar/releases/latest) · [使用说明](docs/guide.md) · [开发](docs/development.md)
 
@@ -35,7 +35,7 @@ irm https://github.com/best-shuke/FlowBar/releases/latest/download/install.ps1 |
 
 ### 压缩包
 
-不想用脚本或安装程序的话，也可以下载压缩包，解压就能用，mihomo 内核已经打包在里面。
+不想用脚本或安装程序的话，也可以下载压缩包，解压就能用，rill 内核已经打包在里面。
 
 | 系统 | 安装包 |
 | --- | --- |
@@ -59,16 +59,16 @@ irm https://github.com/best-shuke/FlowBar/releases/latest/download/install.ps1 |
 
 ## 从源码构建
 
-需要 Rust 1.85 以上、Python 3，再准备一个 mihomo 可执行文件：
+需要 Rust 1.85 以上、Python 3，再准备一个 rill 可执行文件：
 
 ```sh
-./scripts/build.sh /path/to/mihomo                       # macOS
-./scripts/build-linux.sh /path/to/mihomo                 # Linux
-.\scripts\build-windows.ps1 -Core C:\path\to\mihomo.exe  # Windows
+./scripts/build.sh /path/to/rill                       # macOS
+./scripts/build-linux.sh /path/to/rill                 # Linux
+.\scripts\build-windows.ps1 -Core C:\path\to\rill.exe  # Windows
 ```
 
 各平台的依赖、测试和发布流程见[开发文档](docs/development.md)。
 
 ## 许可
 
-[MIT](LICENSE)。打包的 mihomo 内核使用 GPL-3.0，详见[第三方说明](Resources/THIRD_PARTY.md)。
+[MIT](LICENSE)。打包的 rill 内核同样使用 MIT 许可，内置的地理数据库使用 GPL-3.0，详见[第三方说明](Resources/THIRD_PARTY.md)。

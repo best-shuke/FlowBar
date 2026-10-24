@@ -16,15 +16,15 @@ ROOT = Path(__file__).resolve().parent.parent
 SYSTEM = platform.system()
 if SYSTEM == 'Darwin':
     GUI = ROOT / 'dist/FlowBar.app/Contents/MacOS/FlowBar'
-    CORE = ROOT / 'dist/FlowBar.app/Contents/Resources/mihomo'
+    CORE = ROOT / 'dist/FlowBar.app/Contents/Resources/rill'
     HOME = Path.home() / 'Library/Application Support/FlowBar'
 elif SYSTEM == 'Windows':
     GUI = ROOT / 'dist/FlowBar/FlowBar.exe'
-    CORE = ROOT / 'dist/FlowBar/mihomo.exe'
+    CORE = ROOT / 'dist/FlowBar/rill.exe'
     HOME = Path(os.environ['LOCALAPPDATA']) / 'FlowBar'
 else:
     GUI = ROOT / 'dist/FlowBar/flowbar'
-    CORE = ROOT / 'dist/FlowBar/mihomo'
+    CORE = ROOT / 'dist/FlowBar/rill'
     HOME = Path.home() / '.local/share/flowbar'
 DATA = HOME / 'Data'
 TOKEN = 'flowbar-local-smoke-test-token'
@@ -54,10 +54,10 @@ def validate(path, directory):
     result = subprocess.run([str(CORE), '-t', '-d', str(directory), '-f', str(path)],
                             capture_output=True, timeout=60)
     if result.returncode:
-        raise RuntimeError('mihomo rejected the generated config')
+        raise RuntimeError('rill rejected the generated config')
 
 def launch(config, directory, log):
-    env = {'HOME': str(Path.home()), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'GOGC': '50'}
+    env = {'HOME': str(Path.home()), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
     if SYSTEM == 'Windows':
         env = {name: os.environ[name] for name in ('SystemRoot', 'TEMP', 'USERPROFILE') if name in os.environ}
     process = subprocess.Popen([str(CORE), '-d', str(directory), '-f', str(config)],
@@ -69,11 +69,11 @@ def launch(config, directory, log):
         except (OSError, http.client.HTTPException):
             pass
         if process.poll() is not None:
-            raise RuntimeError('mihomo exited during startup')
+            raise RuntimeError('rill exited during startup')
         time.sleep(.1)
     process.terminate()
     process.wait(timeout=8)
-    raise RuntimeError('mihomo did not become ready')
+    raise RuntimeError('rill did not become ready')
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix='flowbar-smoke-') as temp:
             config = temp / ('tun-validation.yaml' if tun else 'runtime.yaml')
             render(original, config, tun)
             validate(config, DATA)
-        print('PASS imported profile: both runtime configurations accepted by mihomo -t (no TUN activation)')
+        print('PASS imported profile: both runtime configurations accepted by rill -t (no TUN activation)')
         with (temp / 'real-core.log').open('wb') as log:
             process = launch(temp / 'runtime.yaml', DATA, log)
             try:

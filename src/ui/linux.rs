@@ -741,7 +741,7 @@ pub fn toggle_login() -> Result<()> {
         return remove_login();
     }
     let entry = format!(
-        "[Desktop Entry]\nType=Application\nName=FlowBar\nComment=mihomo 代理托盘\n{}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+        "[Desktop Entry]\nType=Application\nName=FlowBar\nComment=rill 代理托盘\n{}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
         exec_line()?
     );
     fs::create_dir_all(path.parent().unwrap())?;

@@ -23,9 +23,15 @@ use std::{
 use uuid::Uuid;
 
 #[cfg(windows)]
-pub const CORE: &str = "mihomo.exe";
+pub const CORE: &str = "rill.exe";
 #[cfg(not(windows))]
-pub const CORE: &str = "mihomo";
+pub const CORE: &str = "rill";
+/// The core FlowBar 0.4 and earlier ran. A session one of them started can outlive the
+/// update, so its core still counts as one.
+#[cfg(windows)]
+const LEGACY_CORE: &str = "mihomo.exe";
+#[cfg(not(windows))]
+const LEGACY_CORE: &str = "mihomo";
 /// Root-owned TUN sessions and their data cache, one directory per user ID.
 #[cfg(target_os = "macos")]
 const ROOT_BASE: &str = "/Library/Application Support/FlowBar";
@@ -72,7 +78,7 @@ pub fn read_status(path: &Path) -> Option<Status> {
 pub fn running(path: &Path) -> bool {
     read_status(path).is_some_and(|s| s.state == "running" && s.core_pid.is_some_and(is_core))
 }
-/// After a crash or reboot the recorded PID can belong to any process, so it must still be a mihomo.
+/// After a crash or reboot the recorded PID can belong to any process, so it must still be a core.
 #[cfg(target_os = "macos")]
 fn is_core(pid: u32) -> bool {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
@@ -83,12 +89,16 @@ fn is_core(pid: u32) -> bool {
         // Keep the session if the process exists but its path is hidden from us.
         return io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     }
-    Path::new(OsStr::from_bytes(&buffer[..length as usize])).file_name() == Some(OsStr::new(CORE))
+    Path::new(OsStr::from_bytes(&buffer[..length as usize]))
+        .file_name()
+        .is_some_and(|name| name == CORE || name == LEGACY_CORE)
 }
 #[cfg(target_os = "linux")]
 fn is_core(pid: u32) -> bool {
     match fs::read_link(format!("/proc/{pid}/exe")) {
-        Ok(path) => path.file_name() == Some(std::ffi::OsStr::new(CORE)),
+        Ok(path) => path
+            .file_name()
+            .is_some_and(|name| name == CORE || name == LEGACY_CORE),
         // Keep the session if the process exists but its path is hidden from us.
         Err(error) => error.kind() == io::ErrorKind::PermissionDenied,
     }
@@ -125,8 +135,9 @@ fn is_core(pid: u32) -> bool {
         return false;
     }
     let path = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length as usize]));
-    path.file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case(CORE))
+    path.file_name().is_some_and(|name| {
+        name.eq_ignore_ascii_case(CORE) || name.eq_ignore_ascii_case(LEGACY_CORE)
+    })
 }
 /// The bundled files: Contents/Resources of the app on macOS, the executable's directory elsewhere.
 pub fn resources() -> Result<PathBuf> {
@@ -425,7 +436,6 @@ fn run_core(
         ])
         .current_dir(cache)
         .env("HOME", home)
-        .env("GOGC", "50")
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log.try_clone()?));
     #[cfg(target_os = "macos")]
@@ -451,7 +461,7 @@ fn run_core(
                 thread::sleep(Duration::from_millis(100));
             }
             ensure!(ready, "内核启动超时，请检查端口或配置。");
-            // mihomo has loaded the config; drop the copy holding credentials and the secret.
+            // The core has loaded the config; drop the copy holding credentials and the secret.
             let _ = fs::remove_file(config_file);
             // macOS sends DNS to the core's listener; elsewhere the TUN's DNS hijack covers it.
             #[cfg(target_os = "macos")]
@@ -511,7 +521,7 @@ fn copy_regular(source: &Path, target: &Path, owner: Option<u32>) -> Result<()> 
             .mode(0o600)
             .open(&temporary)?;
         io::copy(&mut input, &mut output)?;
-        // Keep the source age so mihomo refreshes providers on their real schedule.
+        // Keep the source age so the core refreshes providers on their real schedule.
         output.set_modified(input.metadata()?.modified()?)?;
         fs::rename(&temporary, target)?;
         Ok(())

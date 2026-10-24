@@ -117,7 +117,7 @@ Arch：sudo pacman -S gtk4"
 [Desktop Entry]
 Type=Application
 Name=FlowBar
-Comment=mihomo 代理托盘
+Comment=rill 代理托盘
 Exec=$(desktop_exec "$target/flowbar")
 Icon=$target/flowbar.png
 Terminal=false

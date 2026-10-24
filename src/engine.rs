@@ -162,7 +162,7 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
     let data = config::home().join("Data");
     config::private_dir(&data)?;
     let core = supervisor::core()?;
-    ensure!(core.is_file(), "应用中缺少 mihomo 内核，请重新打包。");
+    ensure!(core.is_file(), "应用中缺少 rill 内核，请重新打包。");
     let resources = supervisor::resources()?;
     let progress = |message: String| emit(Event::Progress(run.id.clone(), message));
     let mut missing = vec![];
@@ -194,8 +194,7 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
         .arg(&data)
         .arg("-f")
         .arg(&config_file)
-        .current_dir(&data)
-        .env("GOGC", "50");
+        .current_dir(&data);
     if let Some(home) = std::env::var_os("HOME") {
         validate.env("HOME", home);
     }
@@ -251,7 +250,7 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
                 .spawn()?,
         ));
     }
-    emit(Event::Progress(run.id.clone(), "正在启动 mihomo…".into()));
+    emit(Event::Progress(run.id.clone(), "正在启动内核…".into()));
     let deadline = Instant::now() + Duration::from_secs(25);
     loop {
         ensure!(!run.cancelled.load(Ordering::SeqCst), "操作已取消");
@@ -301,7 +300,8 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
     }
 }
 
-/// mihomo logs the actual resource even when a provider or DNS triggers the download.
+/// The core logs the actual resource, in mihomo's words, even when a provider or DNS triggers
+/// the download.
 fn validation_progress(log: &str) -> Option<String> {
     for line in log.lines().rev() {
         let line = line.to_ascii_lowercase();
