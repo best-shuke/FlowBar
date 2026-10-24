@@ -118,7 +118,7 @@ pub fn apple_string(value: &str) -> String {
     )
 }
 
-/// Keeps console programs such as mihomo and curl from opening a console window on Windows.
+/// Keeps console programs such as the core and curl from opening a console window on Windows.
 pub fn background(command: &mut Command) -> &mut Command {
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
@@ -428,7 +428,7 @@ pub fn supervise(
         });
     }
     background(&mut child_command);
-    let mut child = ManagedChild::new(child_command.spawn().context("无法启动 mihomo")?);
+    let mut child = ManagedChild::new(child_command.spawn().context("无法启动内核")?);
     // Best effort: a job that forbids nesting cannot take the core.
     #[cfg(windows)]
     let _job = kill_on_close(&child.0).ok();

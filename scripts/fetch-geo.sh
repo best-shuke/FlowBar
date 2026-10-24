@@ -7,7 +7,7 @@ output=$1
 release=https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest
 python="$(command -v python3 || command -v python)"
 mkdir -p "$output"
-# The release's file name, then the name FlowBar copies into mihomo's data directory.
+# The release's file name, then the name FlowBar copies into the core's data directory.
 for pair in geoip.metadb:geoip.metadb geosite.dat:GeoSite.dat; do
     remote=${pair%%:*} name=${pair#*:}
     curl -fsSL --retry 3 -o "$output/$name" "$release/$remote"

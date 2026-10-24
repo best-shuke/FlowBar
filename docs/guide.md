@@ -83,7 +83,7 @@ macOS 和 Linux 上，卸载前先在设置里关掉「登录时打开」，再�
 
 **macOS**：登录时打开用的是系统登录项，第一次开启时系统可能会让你去登录项设置里批准。TUN 模式改的系统 DNS 在断开后会自动恢复。
 
-**Windows**：左键点托盘图标打开设置，右键打开菜单。TUN 用的是 mihomo 自带的 Wintun，不用另装驱动。
+**Windows**：左键点托盘图标打开设置，右键打开菜单。TUN 用的是 rill 内置的 Wintun，不用另装驱动。
 
 **Linux**：托盘基于 StatusNotifierItem，KDE Plasma 和 Xfce 直接能用，GNOME 需要 AppIndicator 扩展（Ubuntu 默认装了）。桌面没有托盘时，设置窗口就是主界面，关掉窗口会退出 FlowBar 并断开连接。TUN 通过 `pkexec` 提权，DNS 由 TUN 劫持，不会改系统的 DNS 设置。
 
@@ -136,11 +136,11 @@ IPv6 默认关闭，不管导入的配置里怎么写：内核不用 IPv6 解析
 
 **连接失败怎么办？**
 
-先从菜单打开日志看具体原因。端口被占用就到设置里换一个。配置写错的话，mihomo 在启动前的配置检查阶段就会报出来。
+先从菜单打开日志看具体原因。端口被占用就到设置里换一个。配置写错的话，内核在启动前的配置检查阶段就会报出来。
 
 **一直显示「正在下载地理数据库」，或者提示缺少数据库**
 
-配置里用到 `GEOIP`、`GEOSITE` 或 `IP-ASN` 规则时，mihomo 必须先有对应的数据库才能启动。安装包自带 `geoip.metadb` 和 `GeoSite.dat`，第一次连接时直接复制到用户数据目录的 `Data/` 下，不用下载。
+配置里用到 `GEOIP`、`GEOSITE` 或 `IP-ASN` 规则时，内核必须先有对应的数据库才能启动。安装包自带 `geoip.metadb` 和 `GeoSite.dat`，第一次连接时直接复制到用户数据目录的 `Data/` 下，不用下载。
 
 其他数据库（`ASN.mmdb`，以及 `geodata-mode: true` 时的 `GeoIP.dat`）由 FlowBar 在连接前下载。这时节点还没启动，只能直连。FlowBar 会先测一遍几个下载源的速度：配置里写了 `geox-url` 且能连上，就优先用它；其余按速度依次是 GitHub 和 jsDelivr 的几个镜像，一个失败就换下一个。每个下载源的结果记在 `Sessions/<会话 ID>/download.log`。下载不完整的文件会被删掉重下，不会一直卡在同一个坏文件上。下载时不会读取终端里设置的代理环境变量。
 

@@ -1,6 +1,8 @@
-# Builds dist\FlowBar: FlowBar.exe, its mihomo core and the license files, ready to zip.
-# Usage: .\scripts\build-windows.ps1 -Core C:\path\mihomo.exe [-Target aarch64-pc-windows-msvc]
+# Builds dist\FlowBar: FlowBar.exe, its rill core and the license files, ready to zip.
+# Usage: .\scripts\build-windows.ps1 -Core C:\path\rill.exe [-Target aarch64-pc-windows-msvc]
 #        [-Geo <directory from scripts/fetch-geo.sh>]
+# The notices scripts/fetch-rill.sh puts beside the core (LICENSE-RILL-THIRD-PARTY.txt,
+# LICENSE-WINTUN.txt) are bundled when present.
 param(
     [string]$Core,
     [string]$Target,
@@ -10,9 +12,9 @@ $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot)
 
 if (-not $Core) {
-    $found = Get-Command mihomo -ErrorAction SilentlyContinue
+    $found = Get-Command rill -ErrorAction SilentlyContinue
     if (-not $found) {
-        throw '请指定 mihomo.exe 路径：.\scripts\build-windows.ps1 -Core C:\path\mihomo.exe'
+        throw '请指定 rill.exe 路径：.\scripts\build-windows.ps1 -Core C:\path\rill.exe'
     }
     $Core = $found.Source
 }
@@ -31,8 +33,15 @@ $app = Join-Path $staging 'FlowBar'
 New-Item -ItemType Directory -Force $app | Out-Null
 try {
     Copy-Item "$output\flowbar.exe" "$app\FlowBar.exe"
-    Copy-Item $Core "$app\mihomo.exe"
-    Copy-Item Resources\THIRD_PARTY.md, Resources\LICENSE-MIHOMO $app
+    Copy-Item $Core "$app\rill.exe"
+    # Not a program: lets FlowBar 0.4.0 and earlier recognise this package when they update,
+    # and the uninstaller they left recognise the directory.
+    Copy-Item Resources\legacy-core-placeholder.txt "$app\mihomo.exe"
+    Copy-Item Resources\THIRD_PARTY.md, Resources\LICENSE-RILL, Resources\NOTICE-RILL, Resources\LICENSE-GPL-3.0 $app
+    $coreDirectory = Split-Path $Core
+    foreach ($notice in 'LICENSE-RILL-THIRD-PARTY.txt', 'LICENSE-WINTUN.txt') {
+        if (Test-Path "$coreDirectory\$notice") { Copy-Item "$coreDirectory\$notice" $app }
+    }
     if ($Geo) { Copy-Item "$Geo\geoip.metadb", "$Geo\GeoSite.dat" $app }
     $licenseArguments = @('scripts\licenses.py', "$app\LICENSE-RUST-DEPENDENCIES.txt")
     if ($Target) { $licenseArguments += $Target }

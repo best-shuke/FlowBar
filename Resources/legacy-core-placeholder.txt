@@ -1,0 +1,8 @@
+FlowBar 现在使用同目录下的 rill 内核。这个文件不是程序，FlowBar 不会运行它：
+它只让 FlowBar 0.4.0 及更早版本的应用内更新认出新的安装包（这些版本会检查安装包里有没有
+mihomo 内核），并让这些版本留下的卸载程序认出安装目录。
+
+FlowBar now runs the rill core beside this file. This is not a program and is never run: it
+only lets the in-app updater of FlowBar 0.4.0 and earlier, which checks a package for a mihomo
+core, recognise the new package, and lets the uninstaller those versions left recognise the
+installation directory.

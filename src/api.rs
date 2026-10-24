@@ -29,7 +29,7 @@ impl Api {
         );
         let address = SocketAddr::from(([127, 0, 0, 1], self.port));
         let mut connection = TcpStream::connect_timeout(&address, Duration::from_millis(800))
-            .context("无法连接 mihomo")?;
+            .context("无法连接内核")?;
         connection.set_read_timeout(Some(Duration::from_secs(2)))?;
         connection.set_write_timeout(Some(Duration::from_secs(2)))?;
         let bytes = body
@@ -52,7 +52,7 @@ impl Api {
         let (status, bytes) = decode_response(&response)?;
         ensure!(
             (200..300).contains(&status),
-            "mihomo 控制接口返回 HTTP {status}"
+            "内核控制接口返回 HTTP {status}"
         );
         if bytes.is_empty() {
             Ok(Value::Null)

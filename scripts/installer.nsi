@@ -53,8 +53,11 @@ Function ${un}CloseFlowBar
     Pop $0
     ${For} $0 1 80
         Delete "$INSTDIR\FlowBar.exe"
+        Delete "$INSTDIR\rill.exe"
+        ; The core FlowBar 0.4.0 and earlier ran, or the placeholder that replaced it.
         Delete "$INSTDIR\mihomo.exe"
         ${IfNot} ${FileExists} "$INSTDIR\FlowBar.exe"
+        ${AndIfNot} ${FileExists} "$INSTDIR\rill.exe"
         ${AndIfNot} ${FileExists} "$INSTDIR\mihomo.exe"
             Return
         ${EndIf}
@@ -102,7 +105,7 @@ SectionEnd
 Function un.onInit
     StrCpy $0 "$INSTDIR" "" -8
     ${If} $0 != "\FlowBar"
-    ${OrIfNot} ${FileExists} "$INSTDIR\mihomo.exe"
+    ${OrIfNot} ${FileExists} "$INSTDIR\rill.exe"
         MessageBox MB_ICONSTOP "找不到 FlowBar 的安装目录。" /SD IDOK
         Abort
     ${EndIf}

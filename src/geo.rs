@@ -1,4 +1,4 @@
-//! The Geo databases mihomo opens while it parses rules, before any node can carry traffic.
+//! The Geo databases the core opens while it parses rules, before any node can carry traffic.
 //! A missing one comes from the copy bundled with a release, or from the fastest of several
 //! mirrors; the configuration check would otherwise fetch it directly from GitHub.
 use crate::{config, process, update};
@@ -17,7 +17,7 @@ use std::{
 };
 use uuid::Uuid;
 
-/// One database, under the file names mihomo accepts for it without regard to case.
+/// One database, under the file names the core (like mihomo) accepts for it without regard to case.
 pub struct Geo {
     pub label: &'static str,
     /// The first name is the one bundled and downloaded.
@@ -50,7 +50,7 @@ static ASN: Geo = Geo {
     key: "asn",
     remote: "GeoLite2-ASN.mmdb",
 };
-/// meta-rules-dat publishes the same files at each; mihomo's own default is the first.
+/// meta-rules-dat publishes the same files at each; the core's own default, as mihomo's, is the first.
 const MIRRORS: &[&str] = &[
     "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/",
     "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/",
@@ -63,7 +63,7 @@ const NULL: &str = "NUL";
 const NULL: &str = "/dev/null";
 
 /// The databases that inline rules and DNS need and `data` lacks in a usable form.
-/// Providers are loaded by mihomo itself; its live log remains authoritative.
+/// Providers are loaded by the core itself; its live log remains authoritative.
 pub fn missing(yaml: &str, data: &Path) -> Result<Vec<&'static Geo>> {
     fn rule_uses(value: &Value, kinds: &[&str]) -> bool {
         match value {
@@ -121,7 +121,7 @@ pub fn missing(yaml: &str, data: &Path) -> Result<Vec<&'static Geo>> {
     }
     Ok(missing)
 }
-/// The regular files in `data` that mihomo would open for `geo`.
+/// The regular files in `data` that the core would open for `geo`.
 fn files(geo: &Geo, data: &Path) -> Result<Vec<PathBuf>> {
     Ok(fs::read_dir(data)?
         .flatten()
@@ -185,7 +185,7 @@ fn protobuf(bytes: &[u8]) -> bool {
     !bytes.is_empty()
 }
 
-/// For a database `missing` reported: removes its unusable files, which mihomo would open
+/// For a database `missing` reported: removes its unusable files, which the core would open
 /// before a new copy, then copies in the one bundled in `resources` if this build has it.
 pub fn install_bundled(geo: &Geo, resources: &Path, data: &Path) -> Result<bool> {
     for path in files(geo, data)? {
@@ -201,7 +201,7 @@ pub fn install_bundled(geo: &Geo, resources: &Path, data: &Path) -> Result<bool>
 
 /// Downloads `geo` into `data`: from the profile's `geox-url` first when it answers, then
 /// from the mirrors, fastest first. False when the system has no curl, which leaves the
-/// download to mihomo.
+/// download to the core.
 pub fn download(
     geo: &Geo,
     yaml: &str,
@@ -379,7 +379,7 @@ mod tests {
             missing(yaml),
             ["Country.mmdb / geoip.metadb", "GeoSite.dat", "ASN.mmdb"]
         );
-        // mihomo accepts these names without regard to case, including legacy MMDB aliases.
+        // The core accepts these names without regard to case, including legacy MMDB aliases.
         fs::write(data.path().join("geoip.db"), MMDB_FILE).unwrap();
         fs::write(data.path().join("geosite.dat"), DAT_FILE).unwrap();
         fs::write(data.path().join("asn.mmdb"), MMDB_FILE).unwrap();
@@ -395,7 +395,7 @@ mod tests {
         );
         fs::write(data.path().join("geoip.dat"), DAT_FILE).unwrap();
         assert!(missing(&format!("{yaml}geodata-mode: true\n")).is_empty());
-        // An interrupted download leaves a file that mihomo would only replace by downloading.
+        // An interrupted download leaves a file that the core would only replace by downloading.
         fs::write(data.path().join("geosite.dat"), [0x0A, 0x05, 0x01]).unwrap();
         assert_eq!(missing(yaml), ["GeoSite.dat"]);
 

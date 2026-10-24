@@ -40,9 +40,9 @@ Check $running.HasExited 'Setup ends a running FlowBar before replacing it'
 # it in place, so that -Wait covers the whole run.
 $elsewhere = Join-Path ([IO.Path]::GetTempPath()) "FlowBar-guard-$([guid]::NewGuid())"
 New-Item -ItemType Directory $elsewhere | Out-Null
-Copy-Item (Join-Path $directory 'Uninstall.exe'), (Join-Path $directory 'mihomo.exe') $elsewhere
+Copy-Item (Join-Path $directory 'Uninstall.exe'), (Join-Path $directory 'rill.exe') $elsewhere
 Start-Process (Join-Path $elsewhere 'Uninstall.exe') -ArgumentList '/S', "_?=$elsewhere" -Wait
-Check (Test-Path (Join-Path $elsewhere 'mihomo.exe')) 'the uninstaller keeps a directory not named FlowBar'
+Check (Test-Path (Join-Path $elsewhere 'rill.exe')) 'the uninstaller keeps a directory not named FlowBar'
 Remove-Item -Recurse -Force $elsewhere
 
 Set-ItemProperty $run FlowBar "`"$executable`""

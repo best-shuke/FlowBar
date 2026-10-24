@@ -354,7 +354,7 @@ pub fn copy_providers(yaml: &str, source: &Path, destination: &Path) -> Result<(
             let target = destination.join(relative);
             private_dir(target.parent().unwrap())?;
             private_write(&target, &fs::read(&origin)?)?;
-            // Keep the cache age so mihomo refreshes the provider on its real schedule.
+            // Keep the cache age so the core refreshes the provider on its real schedule.
             fs::File::options()
                 .write(true)
                 .open(&target)?

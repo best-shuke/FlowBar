@@ -12,7 +12,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  MIHOMO_VERSION: v1.19.33
+  # The bundled core: a rill release (https://github.com/best-shuke/rill/releases).
+  RILL_VERSION: v0.1.0
 
 jobs:
   test:
@@ -23,16 +24,16 @@ jobs:
         include:
           - os: macos-15
             system: macos
-            core: darwin-arm64
-            sha256: 060b64b0f2c9a310831db0fe4adb2878de67bfa606c311813c1f13966aa504b6
+            target_core: aarch64-apple-darwin
+            sha256: RILL_SHA256_AARCH64_APPLE_DARWIN
           - os: ubuntu-22.04
             system: linux
-            core: linux-amd64-compatible
-            sha256: 386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6
+            target_core: x86_64-unknown-linux-musl
+            sha256: RILL_SHA256_X86_64_UNKNOWN_LINUX_MUSL
           - os: windows-2022
             system: windows
-            core: windows-amd64-compatible
-            sha256: 7aaf636a4f2172dcd8ec34ac4f52797b059195e5afd6409508c963e545f8864d
+            target_core: x86_64-pc-windows-msvc
+            sha256: RILL_SHA256_X86_64_PC_WINDOWS_MSVC
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -41,7 +42,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Locate core
-        run: echo "CORE=$RUNNER_TEMP/mihomo${{ matrix.system == 'windows' && '.exe' || '' }}" >> "$GITHUB_ENV"
+        run: echo "CORE=$RUNNER_TEMP/rill/rill${{ matrix.system == 'windows' && '.exe' || '' }}" >> "$GITHUB_ENV"
 
       - name: Install Linux dependencies
         if: matrix.system == 'linux'
@@ -59,8 +60,11 @@ jobs:
         run: cargo test --locked -- --test-threads=1
 
       - name: Package
+        env:
+          # Reads rill's release while that repository is private; empty otherwise.
+          GH_TOKEN: ${{ secrets.RILL_TOKEN }}
         run: |
-          ./scripts/fetch-mihomo.sh "$MIHOMO_VERSION" ${{ matrix.core }} ${{ matrix.sha256 }} "$CORE"
+          ./scripts/fetch-rill.sh "$RILL_VERSION" ${{ matrix.target_core }} ${{ matrix.sha256 }} "$(dirname "$CORE")"
           ./scripts/fetch-geo.sh "$RUNNER_TEMP/geo"
           case ${{ matrix.system }} in
             macos) ./scripts/build.sh "$CORE" "$RUNNER_TEMP/geo" ;;
