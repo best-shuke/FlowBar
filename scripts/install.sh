@@ -68,7 +68,9 @@ main() {
 
     temporary="$(mktemp -d)"
     trap 'rm -rf "$temporary"' EXIT
-    echo "正在下载 FlowBar $version（$system-$arch）…"
+    # Braces end each name: macOS's bash 3.2 reads the first byte of full-width
+    # punctuation as a letter, and would fail on "$version（" as an unbound variable.
+    echo "正在下载 FlowBar ${version}（$system-${arch}）…"
     curl -fL --progress-bar -o "$temporary/$asset" \
         "https://github.com/$REPOSITORY/releases/download/v$version/$asset" ||
         fail "下载失败。"
@@ -117,7 +119,7 @@ Icon=$target/flowbar.png
 Terminal=false
 Categories=Network;
 EOF
-        echo "已安装到 $target，应用菜单里也能找到 FlowBar。"
+        echo "已安装到 ${target}，应用菜单里也能找到 FlowBar。"
         if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
             nohup "$target/flowbar" >/dev/null 2>&1 </dev/null &
         fi
