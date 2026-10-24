@@ -3,6 +3,11 @@
 # Usage: .\scripts\installer-smoke-test.ps1 dist\FlowBar-<version>-windows-x86_64-setup.exe
 param([Parameter(Mandatory)][string]$Setup)
 $ErrorActionPreference = 'Stop'
+# GitHub shows the logs only to maintainers, but annotations to everyone.
+trap {
+    if ($env:GITHUB_ACTIONS) { Write-Host "::error::$_" }
+    break
+}
 $directory = Join-Path $env:LOCALAPPDATA 'Programs\FlowBar'
 $executable = Join-Path $directory 'FlowBar.exe'
 $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'FlowBar.lnk'

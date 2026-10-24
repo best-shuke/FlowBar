@@ -1,9 +1,11 @@
-; Packs dist\FlowBar into a Setup program that installs it for the current user, in
+﻿; Packs dist\FlowBar into a Setup program that installs it for the current user, in
 ; %LOCALAPPDATA%\Programs\FlowBar where the in-app update can replace it, with a Start
 ; menu shortcut and an uninstaller. Needs NSIS 3.04 or later, which reads the paths
 ; below relative to this script:
 ;   makensis -DVERSION=0.2.1 -DARCH=x86_64 scripts\installer.nsi
 ; The Setup program's /S installs silently and does not open FlowBar afterwards.
+; Saved as UTF-8 with a BOM: makensis on Windows reads a file without one in the
+; system code page, which would garble the Chinese text.
 Unicode true
 ManifestDPIAware true
 SetCompressor /SOLID lzma
