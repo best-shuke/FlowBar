@@ -438,8 +438,8 @@ fn verify_runs(new: &Path, version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Returns the HTTP status and, unless `--output` is given, the response body.
-fn curl(url: &str, proxy: Option<u16>, arguments: &[&str]) -> Result<(u16, Vec<u8>)> {
+/// The system curl, limited to HTTPS and without the user's settings or proxy variables.
+pub fn curl_command() -> Result<Command> {
     #[cfg(unix)]
     let program = PathBuf::from("/usr/bin/curl");
     // Windows 10 and later include curl.
@@ -448,25 +448,27 @@ fn curl(url: &str, proxy: Option<u16>, arguments: &[&str]) -> Result<(u16, Vec<u
     ensure!(program.is_file(), "找不到 curl，无法连接 GitHub。");
     let mut command = Command::new(program);
     // -q must come first: it skips the user's ~/.curlrc.
-    command
-        .args([
-            "-q",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--connect-timeout",
-            "15",
-            "--user-agent",
-            concat!("FlowBar/", env!("CARGO_PKG_VERSION")),
-            "--write-out",
-            "\n%{http_code}",
-        ])
-        .args(arguments);
+    command.args([
+        "-q",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--user-agent",
+        concat!("FlowBar/", env!("CARGO_PKG_VERSION")),
+    ]);
     process::clean_env(&mut command);
+    Ok(command)
+}
+/// Returns the HTTP status and, unless `--output` is given, the response body.
+fn curl(url: &str, proxy: Option<u16>, arguments: &[&str]) -> Result<(u16, Vec<u8>)> {
+    let mut command = curl_command()?;
+    command
+        .args(["--connect-timeout", "15", "--write-out", "\n%{http_code}"])
+        .args(arguments);
     if let Some(port) = proxy {
         command.args(["--proxy", &format!("http://127.0.0.1:{port}")]);
     }

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Builds dist/FlowBar: the program, its mihomo core and the license files, ready to pack.
+# Usage: build-linux.sh [mihomo] [Geo directory from scripts/fetch-geo.sh]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo build --release --locked
@@ -21,6 +22,9 @@ mkdir -p "$APP"
 install -m 755 target/release/flowbar "$APP/flowbar"
 install -m 755 "$CORE" "$APP/mihomo"
 install -m 644 Resources/linux/flowbar.png Resources/THIRD_PARTY.md Resources/LICENSE-MIHOMO "$APP/"
+if [[ $# -ge 2 ]]; then
+    install -m 644 "$2/geoip.metadb" "$2/GeoSite.dat" "$APP/"
+fi
 python3 scripts/licenses.py "$APP/LICENSE-RUST-DEPENDENCIES.txt"
 "$APP/flowbar" --version
 rm -rf dist/FlowBar

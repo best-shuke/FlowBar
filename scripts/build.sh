@@ -1,4 +1,5 @@
 #!/bin/zsh
+# Usage: build.sh [mihomo] [Geo directory from scripts/fetch-geo.sh]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --release --locked
@@ -24,6 +25,9 @@ fi
 cp "$CORE" "$APP/Contents/Resources/mihomo"
 chmod 755 "$APP/Contents/Resources/mihomo"
 cp Resources/THIRD_PARTY.md "$APP/Contents/Resources/"
+if [[ $# -ge 2 ]]; then
+    cp "$2/geoip.metadb" "$2/GeoSite.dat" "$APP/Contents/Resources/"
+fi
 cp Resources/LICENSE-MIHOMO "$APP/Contents/Resources/"
 python3 scripts/licenses.py "$APP/Contents/Resources/LICENSE-RUST-DEPENDENCIES.txt"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"

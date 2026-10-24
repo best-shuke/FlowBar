@@ -1,8 +1,10 @@
 # Builds dist\FlowBar: FlowBar.exe, its mihomo core and the license files, ready to zip.
 # Usage: .\scripts\build-windows.ps1 -Core C:\path\mihomo.exe [-Target aarch64-pc-windows-msvc]
+#        [-Geo <directory from scripts/fetch-geo.sh>]
 param(
     [string]$Core,
-    [string]$Target
+    [string]$Target,
+    [string]$Geo
 )
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot)
@@ -31,6 +33,7 @@ try {
     Copy-Item "$output\flowbar.exe" "$app\FlowBar.exe"
     Copy-Item $Core "$app\mihomo.exe"
     Copy-Item Resources\THIRD_PARTY.md, Resources\LICENSE-MIHOMO $app
+    if ($Geo) { Copy-Item "$Geo\geoip.metadb", "$Geo\GeoSite.dat" $app }
     $licenseArguments = @('scripts\licenses.py', "$app\LICENSE-RUST-DEPENDENCIES.txt")
     if ($Target) { $licenseArguments += $Target }
     python @licenseArguments

@@ -4,6 +4,7 @@
 mod api;
 mod config;
 mod engine;
+mod geo;
 mod process;
 mod supervisor;
 mod ui;

@@ -87,6 +87,9 @@ jobs:
       - name: Fetch mihomo
         run: ./scripts/fetch-mihomo.sh "$MIHOMO_VERSION" ${{ matrix.core }} ${{ matrix.sha256 }} "$CORE"
 
+      - name: Fetch Geo databases
+        run: ./scripts/fetch-geo.sh "$RUNNER_TEMP/geo"
+
       # scripts/licenses.py reads the locked dependency sources offline.
       - name: Test
         run: |
@@ -98,9 +101,9 @@ jobs:
       - name: Build
         run: |
           case ${{ matrix.system }} in
-            macos) ./scripts/build.sh "$CORE" ;;
-            linux) ./scripts/build-linux.sh "$CORE" ;;
-            windows) pwsh -File scripts/build-windows.ps1 -Core "$CORE" -Target "${{ matrix.target }}" ;;
+            macos) ./scripts/build.sh "$CORE" "$RUNNER_TEMP/geo" ;;
+            linux) ./scripts/build-linux.sh "$CORE" "$RUNNER_TEMP/geo" ;;
+            windows) pwsh -File scripts/build-windows.ps1 -Core "$CORE" -Target "${{ matrix.target }}" -Geo "$RUNNER_TEMP/geo" ;;
           esac
 
       - name: Package
@@ -146,5 +149,6 @@ jobs:
             --title "FlowBar ${GITHUB_REF_NAME#v}" \
             --notes "macOS / Linux 在终端运行 \`curl -fsSL $DOWNLOAD/install.sh | sh\`；Windows 下载 \`setup.exe\` 双击安装，或在 PowerShell 运行 \`irm $DOWNLOAD/install.ps1 | iex\`。
 
-          内置 mihomo $MIHOMO_VERSION（GPL-3.0，源码：https://github.com/MetaCubeX/mihomo/tree/$MIHOMO_VERSION）。" \
+          内置 mihomo $MIHOMO_VERSION（GPL-3.0，源码：https://github.com/MetaCubeX/mihomo/tree/$MIHOMO_VERSION）。
+          内置的 geoip.metadb 和 GeoSite.dat 取自构建当天的 MetaCubeX/meta-rules-dat（GPL-3.0，https://github.com/MetaCubeX/meta-rules-dat）。" \
             --generate-notes

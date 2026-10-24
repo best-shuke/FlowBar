@@ -61,10 +61,11 @@ jobs:
       - name: Package
         run: |
           ./scripts/fetch-mihomo.sh "$MIHOMO_VERSION" ${{ matrix.core }} ${{ matrix.sha256 }} "$CORE"
+          ./scripts/fetch-geo.sh "$RUNNER_TEMP/geo"
           case ${{ matrix.system }} in
-            macos) ./scripts/build.sh "$CORE" ;;
-            linux) ./scripts/build-linux.sh "$CORE" ;;
-            windows) pwsh -File scripts/build-windows.ps1 -Core "$CORE" ;;
+            macos) ./scripts/build.sh "$CORE" "$RUNNER_TEMP/geo" ;;
+            linux) ./scripts/build-linux.sh "$CORE" "$RUNNER_TEMP/geo" ;;
+            windows) pwsh -File scripts/build-windows.ps1 -Core "$CORE" -Geo "$RUNNER_TEMP/geo" ;;
           esac
 
       # Real interface actions against the packaged app and core; TUN stays off.

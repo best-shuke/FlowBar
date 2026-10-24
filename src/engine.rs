@@ -1,6 +1,7 @@
 use crate::{
     api::{Api, Group},
     config::{self, Settings},
+    geo,
     process::{self, ManagedChild},
     supervisor, update,
 };
@@ -130,6 +131,7 @@ pub fn start(settings: Settings, emit: Emit) -> Result<Arc<Run>> {
                     background.status_path.join("core.log"),
                     background.status_path.join("bootstrap.log"),
                     background.stage.join("authorization.log"),
+                    background.stage.join("download.log"),
                     background.stage.join("validation.log"),
                 ] {
                     if let Ok(contents) = fs::read_to_string(&path) {
@@ -161,14 +163,28 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
     config::private_dir(&data)?;
     let core = supervisor::core()?;
     ensure!(core.is_file(), "应用中缺少 mihomo 内核，请重新打包。");
-    let missing = config::missing_geo(&runtime, &data)?;
+    let resources = supervisor::resources()?;
+    let progress = |message: String| emit(Event::Progress(run.id.clone(), message));
+    let mut missing = vec![];
+    for geo in geo::missing(&runtime, &data)? {
+        if !geo::install_bundled(geo, &resources, &data)?
+            && !geo::download(
+                geo,
+                &runtime,
+                &data,
+                &run.stage,
+                &run.cancelled,
+                &run.command_pid,
+                &progress,
+            )?
+        {
+            missing.push(geo.label);
+        }
+    }
     if !missing.is_empty() {
-        emit(Event::Progress(
-            run.id.clone(),
-            format!(
-                "缺少地理数据库（{}），配置检查时将尝试下载…",
-                missing.join("、")
-            ),
+        progress(format!(
+            "缺少地理数据库（{}），配置检查时将尝试下载…",
+            missing.join("、")
         ));
     }
     let mut validate = Command::new(&core);
@@ -310,6 +326,8 @@ fn validation_progress(log: &str) -> Option<String> {
     None
 }
 fn validation_error(log: &str, data: &Path, fallback: &str) -> String {
+    // A timeout's own message already points to the log.
+    let fallback = fallback.trim_end_matches("，请查看日志。");
     let lower = log.to_ascii_lowercase();
     let geo_error = lower.lines().any(|line| {
         ["mmdb", "geoip", "geosite", "asn.mmdb"]
@@ -527,8 +545,14 @@ mod validation_tests {
         );
         assert!(error.contains("geox-url") && error.contains(&data.display().to_string()));
         assert!(error.contains("重新导入"));
-        let timeout = validation_error(pending, &data, "配置检查未完成：操作超时");
-        assert!(timeout.contains("地理数据库") && timeout.contains("超时"));
+        let timeout = validation_error(pending, &data, "配置检查未完成：操作超时，请查看日志。");
+        assert!(
+            timeout.contains("地理数据库") && timeout.contains("配置检查未完成：操作超时。请确认")
+        );
+        assert_eq!(
+            validation_error("", &data, "配置检查未完成：操作超时，请查看日志。"),
+            "配置检查未完成：操作超时，请打开日志查看原因。"
+        );
         assert_eq!(
             validation_error(
                 "rules[0] [GEOIP,CN,missing] error: proxy [missing] not found",

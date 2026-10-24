@@ -10,6 +10,14 @@ The bundled core's exact version can be checked with `mihomo -v`
 (Contents/Resources/mihomo on macOS, next to the FlowBar executable elsewhere).
 LICENSE-MIHOMO contains its license. No modifications are made to the core's source.
 
+meta-rules-dat: https://github.com/MetaCubeX/meta-rules-dat (GPL-3.0, the same license text
+as LICENSE-MIHOMO). Release builds bundle its geoip.metadb and geosite.dat (as GeoSite.dat),
+unmodified, from the release published on the day of the build. The IP data in geoip.metadb
+comes from https://github.com/Loyalsoldier/geoip under CC BY-SA 4.0
+(https://creativecommons.org/licenses/by-sa/4.0/) and includes GeoLite2 data created by
+MaxMind, available from https://www.maxmind.com. Databases FlowBar downloads later come from
+the same project or from the profile's geox-url.
+
 On Linux, FlowBar uses the system's GTK 4 libraries (LGPL-2.1-or-later) through dynamic
 linking; they are not included in the package.
 

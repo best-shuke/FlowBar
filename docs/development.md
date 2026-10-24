@@ -15,6 +15,8 @@ cp -R dist/FlowBar.app ~/Applications/
 
 不传路径时，脚本会依次查找已安装的 FlowBar 自带的内核、Clash Verge 的内核和 PATH 里的 mihomo。
 
+想像 Release 一样内置地理数据库，先运行 `./scripts/fetch-geo.sh /path/to/geo`，再把这个目录作为第二个参数传给构建脚本，Windows 上用 `-Geo` 参数。不传的话，安装包里没有数据库，第一次连接时由 FlowBar 下载。
+
 **Windows**（另需带 Windows SDK 的 Visual Studio 生成工具），在 PowerShell 里：
 
 ```powershell
@@ -81,7 +83,7 @@ pwsh -File scripts/installer-smoke-test.ps1 dist/FlowBar-0.2.1-windows-x86_64-se
 2. 提交并推送，等 CI 通过。
 3. 打标签并推送：`git tag v0.3.0 && git push origin v0.3.0`。
 
-推送标签后，`.github/workflows/release.yml` 会核对版本号，下载并校验固定版本的 mihomo，跑一遍测试，然后构建 5 个压缩包（macOS arm64、Windows x86_64 / ARM64、Linux x86_64 / ARM64）和 2 个 Windows 安装程序，连同 `scripts/install.sh`、`scripts/install.ps1` 一起发布 Release。安装脚本总是取最新的 Release，文档里也用 `releases/latest/download/` 链接它们。仓库必须是公开的，应用和安装脚本才能读到 Release。
+推送标签后，`.github/workflows/release.yml` 会核对版本号，下载并校验固定版本的 mihomo 和当天的地理数据库，跑一遍测试，然后构建 5 个压缩包（macOS arm64、Windows x86_64 / ARM64、Linux x86_64 / ARM64）和 2 个 Windows 安装程序，连同 `scripts/install.sh`、`scripts/install.ps1` 一起发布 Release。安装脚本总是取最新的 Release，文档里也用 `releases/latest/download/` 链接它们。仓库必须是公开的，应用和安装脚本才能读到 Release。
 
 应用内更新下载的是压缩包，靠 `FlowBar-<版本>-<系统>-<架构>.zip` / `.tar.gz` 这个文件名找到它，不能改名。
 
@@ -93,6 +95,7 @@ pwsh -File scripts/installer-smoke-test.ps1 dist/FlowBar-0.2.1-windows-x86_64-se
 | --- | --- |
 | `src/config.rs` | 导入 YAML，生成运行配置 |
 | `src/engine.rs` | 连接流程和管理员授权 |
+| `src/geo.rs` | 检查、复制和下载地理数据库 |
 | `src/supervisor.rs` | 监督内核运行，管理临时 DNS |
 | `src/process.rs` | 子进程生命周期 |
 | `src/api.rs` | 调用 mihomo 控制接口 |
