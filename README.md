@@ -18,7 +18,23 @@
 
 ## 下载
 
-到 [Releases](https://github.com/best-shuke/FlowBar/releases/latest) 下载对应的安装包，解压就能用，mihomo 内核已经打包在里面。
+**macOS / Linux**：在终端运行下面这行，会自动下载最新版、装好并打开。用这种方式装，macOS 不会拦截没有签名的应用。
+
+```sh
+curl -fsSL https://github.com/best-shuke/FlowBar/releases/latest/download/install.sh | sh
+```
+
+**Windows**：到 [Releases](https://github.com/best-shuke/FlowBar/releases/latest) 下载 `windows-x86_64-setup.exe`（ARM 电脑用 `windows-arm64-setup.exe`），双击安装，不需要管理员权限。也可以在 PowerShell 里运行：
+
+```powershell
+irm https://github.com/best-shuke/FlowBar/releases/latest/download/install.ps1 | iex
+```
+
+再次运行同样的命令或安装程序，就会更新到最新版。
+
+### 压缩包
+
+不想用脚本或安装程序的话，也可以下载压缩包，解压就能用，mihomo 内核已经打包在里面。
 
 | 系统 | 安装包 |
 | --- | --- |
@@ -28,8 +44,8 @@
 
 建议放在用户目录下，比如 `~/Applications` 或 `%LOCALAPPDATA%\Programs`，这样应用内更新才能替换自己。
 
-- **macOS**：应用没有开发者签名，第一次打开会被系统拦下，去「系统设置 → 隐私与安全性」点「仍要打开」。
-- **Windows**：SmartScreen 拦截时点「更多信息 → 仍要运行」。
+- **macOS**：应用没有开发者签名，用浏览器下载的话，第一次打开会被系统拦下，去「系统设置 → 隐私与安全性」点「仍要打开」。
+- **Windows**：SmartScreen 拦截时点「更多信息 → 仍要运行」，用浏览器下载的安装程序也一样。
 - **Linux**：GNOME 要装 AppIndicator 扩展才能看到托盘图标，Ubuntu 默认已经装了。
 
 ## 快速上手

@@ -2,13 +2,30 @@
 
 ## 安装
 
-从 [Releases](https://github.com/best-shuke/FlowBar/releases/latest) 下载对应平台的安装包。FlowBar 要放在自己有写权限的目录里，应用内更新才能替换它。
+用安装脚本或 Windows 安装程序最省事：自动选对平台和架构，装到当前用户自己的目录里（应用内更新需要这样），装好后直接打开。以后再运行一次就是更新到最新版。正在运行的 FlowBar 会先被退出，连接会断开。
 
-**macOS**：解压后把 `FlowBar.app` 放进 `~/Applications`。应用只有 ad hoc 签名，用浏览器下载的话，第一次打开会被 Gatekeeper 拦下，到「系统设置 → 隐私与安全性」里允许一下就好。用终端下载不会被拦：
+**macOS 和 Linux**，在终端运行：
 
 ```sh
-curl -fLO https://github.com/best-shuke/FlowBar/releases/latest/download/FlowBar-<版本>-macos-arm64.zip
+curl -fsSL https://github.com/best-shuke/FlowBar/releases/latest/download/install.sh | sh
 ```
+
+- macOS 装到 `~/Applications/FlowBar.app`；`/Applications` 里已经有 FlowBar 的话，就更新那一份。用 curl 下载的应用没有隔离标记，Gatekeeper 不会拦。
+- Linux 装到 `~/.local/opt/FlowBar`，并在应用菜单里加一个启动器。缺少 GTK 4 时，脚本会提示该装哪个包。
+
+**Windows**：从 [Releases](https://github.com/best-shuke/FlowBar/releases/latest) 下载 `FlowBar-<版本>-windows-x86_64-setup.exe`（ARM 电脑用 `windows-arm64-setup.exe`），双击运行。SmartScreen 提示「Windows 已保护你的电脑」时，点「更多信息 → 仍要运行」。也可以在 PowerShell 里运行下面这行，它会静默运行同一个安装程序，不会出现 SmartScreen 提示：
+
+```powershell
+irm https://github.com/best-shuke/FlowBar/releases/latest/download/install.ps1 | iex
+```
+
+安装程序装到 `%LOCALAPPDATA%\Programs\FlowBar`，添加开始菜单快捷方式，不需要管理员权限。
+
+### 手动安装
+
+也可以下载压缩包自己解压。FlowBar 要放在自己有写权限的目录里，应用内更新才能替换它。
+
+**macOS**：解压后把 `FlowBar.app` 放进 `~/Applications`。应用只有 ad hoc 签名，用浏览器下载的话，第一次打开会被 Gatekeeper 拦下，到「系统设置 → 隐私与安全性」里允许一下就好。
 
 **Windows**：解压到比如 `%LOCALAPPDATA%\Programs\FlowBar`，运行里面的 `FlowBar.exe`。如果 SmartScreen 提示「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」。
 
@@ -23,7 +40,7 @@ tar -xzf FlowBar-<版本>-linux-x86_64.tar.gz -C ~/.local/opt
 想让它出现在应用菜单里，可以加一个启动器：
 
 ```sh
-cat > ~/.local/share/applications/flowbar.desktop <<EOF
+cat > ~/.local/share/applications/dev.local.FlowBar.desktop <<EOF
 [Desktop Entry]
 Type=Application
 Name=FlowBar
@@ -32,6 +49,16 @@ Icon=$HOME/.local/opt/FlowBar/flowbar.png
 Categories=Network;
 EOF
 ```
+
+### 卸载
+
+macOS 和 Linux 上，卸载前先在设置里关掉「登录时打开」，再退出 FlowBar。
+
+- **macOS**：把 `FlowBar.app` 移到废纸篓。
+- **Windows**：在「设置 → 应用」里卸载 FlowBar，它会一并移除开始菜单快捷方式和登录启动项。手动安装的直接删掉目录。
+- **Linux**：删除 `~/.local/opt/FlowBar` 和 `~/.local/share/applications/dev.local.FlowBar.desktop`。
+
+导入的配置、设置和日志留在用户数据目录里（见[数据存放位置](#数据存放位置)），不需要的话手动删掉。
 
 ## 使用
 

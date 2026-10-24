@@ -25,6 +25,14 @@ cd FlowBar
 
 生成的程序在 `dist\FlowBar`。构建 ARM64 版加上 `-Target aarch64-pc-windows-msvc`。
 
+想再打成安装程序，装好 [NSIS](https://nsis.sourceforge.io/) 3.04 以上，然后运行：
+
+```powershell
+makensis -DVERSION=0.2.1 -DARCH=x86_64 scripts\installer.nsi
+```
+
+安装程序生成在 `dist\FlowBar-0.2.1-windows-x86_64-setup.exe`。`VERSION` 只用在文件名和安装界面上；`ARCH` 是 `x86_64` 或 `arm64`，要和 `dist\FlowBar` 里程序的架构一致。
+
 **Linux**（另需 GTK 4 开发包，Debian/Ubuntu 是 `libgtk-4-dev`，Fedora 是 `gtk4-devel`）：
 
 ```sh
@@ -59,6 +67,10 @@ python3 scripts/privileged-smoke-test.py
 
 # 用已导入的配置完整启动、停止一次
 dist/FlowBar.app/Contents/MacOS/FlowBar --engine-smoke
+
+# Windows 安装程序：静默安装、覆盖正在运行的 FlowBar、卸载
+# 会装到当前用户的 %LOCALAPPDATA%\Programs\FlowBar，最后卸载掉
+pwsh -File scripts/installer-smoke-test.ps1 dist/FlowBar-0.2.1-windows-x86_64-setup.exe
 ```
 
 这些测试都不开 TUN 和 DNS 接管，TUN 实际能不能联网还得在真实环境里试。登录项测试也代替不了真的重启后登录。
@@ -69,7 +81,9 @@ dist/FlowBar.app/Contents/MacOS/FlowBar --engine-smoke
 2. 提交并推送，等 CI 通过。
 3. 打标签并推送：`git tag v0.3.0 && git push origin v0.3.0`。
 
-推送标签后，`.github/workflows/release.yml` 会核对版本号，下载并校验固定版本的 mihomo，跑一遍测试，然后构建 5 个安装包（macOS arm64、Windows x86_64 / ARM64、Linux x86_64 / ARM64）并发布 Release。仓库必须是公开的，应用才能读到 Release。
+推送标签后，`.github/workflows/release.yml` 会核对版本号，下载并校验固定版本的 mihomo，跑一遍测试，然后构建 5 个压缩包（macOS arm64、Windows x86_64 / ARM64、Linux x86_64 / ARM64）和 2 个 Windows 安装程序，连同 `scripts/install.sh`、`scripts/install.ps1` 一起发布 Release。安装脚本总是取最新的 Release，文档里也用 `releases/latest/download/` 链接它们。仓库必须是公开的，应用和安装脚本才能读到 Release。
+
+应用内更新下载的是压缩包，靠 `FlowBar-<版本>-<系统>-<架构>.zip` / `.tar.gz` 这个文件名找到它，不能改名。
 
 升级内置的 mihomo 时，要同时修改 `release.yml` 和 `ci.yml` 里的 `MIHOMO_VERSION` 和各平台的 `sha256`。
 

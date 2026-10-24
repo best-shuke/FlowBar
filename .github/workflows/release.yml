@@ -110,7 +110,11 @@ jobs:
             macos) ditto -c -k --keepParent dist/FlowBar.app "$ASSET.zip" ;;
             linux) tar -C dist -czf "$ASSET.tar.gz" FlowBar ;;
             # Python writes portable zip paths, which the in-app update unpacks with tar.
-            windows) python -c "import shutil, sys; shutil.make_archive(sys.argv[1], 'zip', 'dist', 'FlowBar')" "$ASSET" ;;
+            windows)
+              python -c "import shutil, sys; shutil.make_archive(sys.argv[1], 'zip', 'dist', 'FlowBar')" "$ASSET"
+              PATH="$PATH:/c/Program Files (x86)/NSIS"
+              makensis -DVERSION="$VERSION" -DARCH=${{ matrix.arch }} scripts/installer.nsi
+              mv "dist/$ASSET-setup.exe" . ;;
           esac
 
       - uses: actions/upload-artifact@v4
@@ -123,17 +127,24 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+
       - uses: actions/download-artifact@v4
         with:
           path: assets
           merge-multiple: true
 
+      # Attached to every release, the install scripts stay at releases/latest/download.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cp scripts/install.sh scripts/install.ps1 assets/
+          DOWNLOAD="https://github.com/$GITHUB_REPOSITORY/releases/latest/download"
           gh release create "$GITHUB_REF_NAME" assets/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "FlowBar ${GITHUB_REF_NAME#v}" \
-            --notes "内置 mihomo $MIHOMO_VERSION（GPL-3.0，源码：https://github.com/MetaCubeX/mihomo/tree/$MIHOMO_VERSION）。" \
+            --notes "macOS / Linux 在终端运行 \`curl -fsSL $DOWNLOAD/install.sh | sh\`；Windows 下载 \`setup.exe\` 双击安装，或在 PowerShell 运行 \`irm $DOWNLOAD/install.ps1 | iex\`。
+
+          内置 mihomo $MIHOMO_VERSION（GPL-3.0，源码：https://github.com/MetaCubeX/mihomo/tree/$MIHOMO_VERSION）。" \
             --generate-notes
