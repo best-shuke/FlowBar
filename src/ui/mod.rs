@@ -70,6 +70,7 @@ pub enum Action {
     Reveal,
     Quit,
     Tun,
+    Ipv6,
     Auto,
     Login,
     Logs,
@@ -345,10 +346,11 @@ impl App {
                     self.offer_update(shell, &release);
                 }
             }
-            Action::Tun | Action::Auto | Action::AutoUpdate => {
+            Action::Tun | Action::Ipv6 | Action::Auto | Action::AutoUpdate => {
                 let mut updated = self.ui.borrow().settings.clone();
                 match action {
                     Action::Tun => updated.tun = !updated.tun,
+                    Action::Ipv6 => updated.ipv6 = !updated.ipv6,
                     Action::Auto => updated.auto_connect = !updated.auto_connect,
                     _ => updated.auto_update = !updated.auto_update,
                 }
@@ -842,6 +844,12 @@ impl App {
                 Some(Action::Tun),
                 stopped,
                 Some(ui.settings.tun),
+            ),
+            item(
+                "使用 IPv6",
+                Some(Action::Ipv6),
+                stopped,
+                Some(ui.settings.ipv6),
             ),
             item(
                 "打开后自动连接",

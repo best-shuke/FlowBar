@@ -38,6 +38,7 @@ pub const GEO_NAMES: &[&str] = &[
 pub struct Settings {
     pub profile_name: String,
     pub tun: bool,
+    pub ipv6: bool,
     pub proxy_port: u16,
     pub controller_port: u16,
     pub dns_port: u16,
@@ -51,6 +52,7 @@ impl Default for Settings {
         Self {
             profile_name: "未导入配置".into(),
             tun: true,
+            ipv6: false,
             proxy_port: 17890,
             controller_port: 19090,
             dns_port: 15353,
@@ -272,6 +274,8 @@ pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> 
     set(map, "mode", settings.mode.as_str());
     set(map, "log-level", "warning");
     set(map, "geodata-loader", "memconservative");
+    // FlowBar's setting decides IPv6, whatever the profile says.
+    set(map, "ipv6", settings.ipv6);
     let tun = section(map, "tun")?;
     set(tun, "enable", settings.tun);
     if settings.tun {
@@ -282,9 +286,16 @@ pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> 
             .or_insert(Value::from("mixed"));
         tun.entry(Value::from("dns-hijack"))
             .or_insert(serde_yaml_ng::to_value(["any:53", "tcp://any:53"])?);
+        // Without IPv6 the TUN routes only IPv4. Strict routing makes IPv6 unreachable on
+        // Linux and blocks it on Windows, so IPv6 traffic cannot bypass the proxy; macOS
+        // has no strict routing, but its system DNS answers through the core.
+        if !settings.ipv6 {
+            set(tun, "strict-route", true);
+        }
     }
     let dns = section(map, "dns")?;
     set(dns, "listen", format!("127.0.0.1:{}", settings.dns_port));
+    set(dns, "ipv6", settings.ipv6);
     if settings.tun {
         set(dns, "enable", true);
         dns.entry(Value::from("nameserver"))
@@ -540,6 +551,32 @@ mod tests {
             Some("192.168.1.0/24")
         );
         assert_eq!(dns_port(&output).unwrap(), 15353);
+    }
+    #[test]
+    fn ipv6_stays_off_unless_enabled() {
+        let yaml = format!("ipv6: true\n{FIXTURE}  ipv6: true\n");
+        let render = |settings: &Settings| parse(&runtime(&yaml, settings, "secret").unwrap());
+        let off = render(&Settings::default()).unwrap();
+        assert_eq!(off["ipv6"].as_bool(), Some(false));
+        assert_eq!(off["dns"]["ipv6"].as_bool(), Some(false));
+        assert_eq!(off["tun"]["strict-route"].as_bool(), Some(true));
+        let on = render(&Settings {
+            ipv6: true,
+            ..Settings::default()
+        })
+        .unwrap();
+        assert_eq!(on["ipv6"].as_bool(), Some(true));
+        assert_eq!(on["dns"]["ipv6"].as_bool(), Some(true));
+        assert!(on["tun"]["strict-route"].is_null());
+        let proxy_only = render(&Settings {
+            tun: false,
+            ..Settings::default()
+        })
+        .unwrap();
+        assert!(proxy_only["tun"]["strict-route"].is_null());
+        // Settings saved before the option existed load with IPv6 off.
+        let saved: Settings = serde_json::from_str(r#"{"tun":true}"#).unwrap();
+        assert!(!saved.ipv6);
     }
     #[test]
     fn drops_extra_inbounds_and_accepts_empty_sections() {

@@ -87,6 +87,16 @@ macOS 和 Linux 上，卸载前先在设置里关掉「登录时打开」，再�
 
 **Linux**：托盘基于 StatusNotifierItem，KDE Plasma 和 Xfce 直接能用，GNOME 需要 AppIndicator 扩展（Ubuntu 默认装了）。桌面没有托盘时，设置窗口就是主界面，关掉窗口会退出 FlowBar 并断开连接。TUN 通过 `pkexec` 提权，DNS 由 TUN 劫持，不会改系统的 DNS 设置。
 
+### IPv6
+
+IPv6 默认关闭，不管导入的配置里怎么写：内核不用 IPv6 解析和连接，DNS 也不返回 IPv6 地址，网站都走 IPv4。用 TUN 时还会挡住 IPv6，免得它绕过代理：
+
+- **Linux**：IPv6 全部不可达。
+- **Windows**：拦截其他程序的 IPv6 连接，以及不经过 TUN 的 DNS 查询。个别需要直接访问局域网 DNS 的程序（比如虚拟机）可能因此受影响。
+- **macOS**：系统不支持这种拦截，但系统 DNS 由 FlowBar 接管，程序拿不到 IPv6 地址。
+
+需要 IPv6 时（比如节点地址是 IPv6），断开连接后在菜单里勾选「使用 IPv6」，内核和 DNS 就都会启用 IPv6，TUN 也会接管 IPv6 流量。没有托盘的 Linux 桌面可以把 `settings.json` 里的 `ipv6` 改成 `true`。
+
 ## 更新
 
 「自动检查更新」默认开启：打开 FlowBar 约 10 秒后查一次 GitHub Releases，之后每天查一次。自动检查失败时不会弹窗，一小时后再试。也可以在菜单里点「检查更新…」，或者在命令行运行 `flowbar --check-update`。
@@ -110,7 +120,7 @@ macOS 和 Linux 上，卸载前先在设置里关掉「登录时打开」，再�
 | 路径 | 内容 |
 | --- | --- |
 | `profile.yaml` | 导入配置的副本，原文件不会被改动 |
-| `settings.json` | 端口、模式、自启和节点选择 |
+| `settings.json` | 端口、模式、IPv6、自启和节点选择 |
 | `Data/` | Geo 数据库、provider 文件和缓存 |
 | `Sessions/` | 每次连接的日志和状态，只保留最近 5 次 |
 
