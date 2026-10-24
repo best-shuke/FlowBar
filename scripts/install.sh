@@ -30,7 +30,11 @@ desktop_exec() {
 }
 
 main() {
-    [ "$(id -u)" -ne 0 ] || fail "请不要用 sudo 运行，FlowBar 安装在当前用户的目录里。"
+    # A root login on Linux installs into root's own home. Through sudo, FlowBar would
+    # land in root's home instead of the user's, or in the user's home owned by root.
+    if [ "$(id -u)" -eq 0 ] && { [ "${SUDO_USER:-root}" != root ] || [ "$(uname -s)" = Darwin ]; }; then
+        fail "请不要通过 sudo 运行（sudo -i 也不行），FlowBar 安装在当前用户的目录里。"
+    fi
     command -v curl >/dev/null || fail "需要 curl。"
 
     case "$(uname -s)" in
