@@ -24,7 +24,9 @@ function Install {
 }
 
 Install
-Check ((& $executable --version) -like 'FlowBar *') 'the installed FlowBar runs'
+# PowerShell reads a GUI program's output only when it is piped on; otherwise it closes
+# the pipe while FlowBar still writes to it.
+Check ((& $executable --version | Out-String) -match '^FlowBar ') 'the installed FlowBar runs'
 Check (Test-Path $shortcut) 'Setup adds a Start menu shortcut'
 Check ((Get-ItemProperty $entry).InstallLocation -eq $directory) 'Setup registers its uninstaller'
 
