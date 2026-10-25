@@ -12,7 +12,7 @@ concurrency:
 
 env:
   # The bundled core: a rill release (https://github.com/best-shuke/rill/releases).
-  RILL_VERSION: v0.1.1
+  RILL_VERSION: v0.1.2
 
 jobs:
   build:
@@ -24,29 +24,29 @@ jobs:
             system: macos
             arch: arm64
             target_core: aarch64-apple-darwin
-            sha256: 6961ecc60f4cfabe39cbaf3c534bffb034299f08d741c16a077070540998e01a
+            sha256: efe63338d1d5c1425dd8a55723ad2840582824e797619ae018b431365051f221
           - os: ubuntu-22.04
             system: linux
             arch: x86_64
             target_core: x86_64-unknown-linux-musl
-            sha256: ffa2f9f31e308c2e67add184b0fc83c25a30031ace630a961e07df43623d0990
+            sha256: 5531c6efb473cdc97eeffa54aed83611608c45bdffbf660a9d3e953f9c9dbc0e
           - os: ubuntu-22.04-arm
             system: linux
             arch: arm64
             target_core: aarch64-unknown-linux-musl
-            sha256: a614bcbc56ffcefa171874ccebef83ef4562ca6bd14509c1866b486e1e25229e
+            sha256: 5e442350bd8262618d2feb056b5960940c1e7806512349937cfec3ac70f29960
           - os: windows-2022
             system: windows
             arch: x86_64
             target_core: x86_64-pc-windows-msvc
-            sha256: 5aa997fc72892b8fbf5b37ef004dde08a64603435eb5e48dcb98f6920d071d96
+            sha256: fca3e02f47c28bbf2aa5fd8864f7871509bc4930bada985ded36a20967508512
           # Cross-built: the x64 runner has the ARM64 MSVC tools.
           - os: windows-2022
             system: windows
             arch: arm64
             target: aarch64-pc-windows-msvc
             target_core: aarch64-pc-windows-msvc
-            sha256: fd32dc46244b18c65118b1562eba71d3eb7d47ef9025aa03df6a0d961efd8df6
+            sha256: 1e5fb52e9e7bf636d11365b7e6953abc745f5d817ea5b8ee8e66cfcb76f2e67c
     runs-on: ${{ matrix.os }}
     defaults:
       run:
