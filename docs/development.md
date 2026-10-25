@@ -77,6 +77,8 @@ pwsh -File scripts/installer-smoke-test.ps1 dist/FlowBar-0.2.1-windows-x86_64-se
 
 这些测试都不开 TUN 和 DNS 接管，TUN 实际能不能联网还得在真实环境里试。登录项测试也代替不了真的重启后登录。
 
+CI 会把打包好的 macOS 应用存成 `FlowBar-macos-arm64` 附件，保留 14 天，在 Actions 运行页面底部下载，可以用来在 Mac 上实际试 TUN。
+
 ## 发布
 
 1. 修改 `Cargo.toml` 的 `version` 和 `Resources/Info.plist` 的 `CFBundleShortVersionString`，两者必须一致（`cargo test` 会检查）；`CFBundleVersion` 加一。然后运行 `cargo build` 更新 `Cargo.lock`。
@@ -87,7 +89,7 @@ pwsh -File scripts/installer-smoke-test.ps1 dist/FlowBar-0.2.1-windows-x86_64-se
 
 应用内更新下载的是压缩包，靠 `FlowBar-<版本>-<系统>-<架构>.zip` / `.tar.gz` 这个文件名找到它，不能改名。
 
-升级内置的 rill 时，要同时修改 `release.yml` 和 `ci.yml` 里的 `RILL_VERSION` 和各平台的 `sha256`（rill Release 的 `SHA256SUMS` 里有）。rill 仓库是私有的时候，要在 FlowBar 仓库的 Actions secrets 里放一个能读 rill 仓库的令牌 `RILL_TOKEN`，`fetch-rill.sh` 会用它下载。
+升级内置的 rill 时，要同时修改 `release.yml` 和 `ci.yml` 里的 `RILL_VERSION` 和各平台的 `sha256`（rill Release 的 `SHA256SUMS` 里有）。
 
 安装包里还有一个名为 `mihomo`（Windows 上是 `mihomo.exe`）的占位文本文件，内容见 `Resources/legacy-core-placeholder.txt`：FlowBar 0.4.0 及更早版本的应用内更新会检查新安装包里有没有 mihomo 内核，旧版安装程序留下的卸载程序也靠它认出安装目录。等不再需要从这些版本升级时可以去掉。
 
