@@ -3,7 +3,6 @@
 # core, rill (rill.exe), with the notices of what it links: LICENSE-RILL-THIRD-PARTY.txt and,
 # for Windows, LICENSE-WINTUN.txt. rill's own LICENSE and NOTICE are in Resources/.
 # Usage: fetch-rill.sh <version, e.g. v0.1.0> <target, e.g. aarch64-apple-darwin> <sha256> <directory>
-# With GH_TOKEN set, the GitHub CLI downloads it, which also reads a private repository.
 set -euo pipefail
 version=$1 target=$2 expected=$3 output=$4
 repository=best-shuke/rill
@@ -14,11 +13,7 @@ esac
 asset="rill-$version-$target.$extension"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-if [[ -n ${GH_TOKEN:-} ]]; then
-    gh release download "$version" --repo "$repository" --pattern "$asset" --dir "$work"
-else
-    curl -fsSL -o "$work/$asset" "https://github.com/$repository/releases/download/$version/$asset"
-fi
+curl -fsSL -o "$work/$asset" "https://github.com/$repository/releases/download/$version/$asset"
 mkdir -p "$output"
 python="$(command -v python3 || command -v python)"
 "$python" - "$work/$asset" "$expected" "$output" <<'PY'

@@ -24,29 +24,29 @@ jobs:
             system: macos
             arch: arm64
             target_core: aarch64-apple-darwin
-            sha256: RILL_SHA256_AARCH64_APPLE_DARWIN
+            sha256: 175767afb91ff2daa62391edf0ae1aa51cdc0d9c57cf0ae7d6bcc43fe8214872
           - os: ubuntu-22.04
             system: linux
             arch: x86_64
             target_core: x86_64-unknown-linux-musl
-            sha256: RILL_SHA256_X86_64_UNKNOWN_LINUX_MUSL
+            sha256: b41978cbe054424c917ba8016e8a62d38e0ec3bf501627383b4290a6a5033c6e
           - os: ubuntu-22.04-arm
             system: linux
             arch: arm64
             target_core: aarch64-unknown-linux-musl
-            sha256: RILL_SHA256_AARCH64_UNKNOWN_LINUX_MUSL
+            sha256: 7f68095bf8fb9395cdf1bf9e23d17ee85775a1fb8594c7e079f0f47277c790a5
           - os: windows-2022
             system: windows
             arch: x86_64
             target_core: x86_64-pc-windows-msvc
-            sha256: RILL_SHA256_X86_64_PC_WINDOWS_MSVC
+            sha256: ab8a0edadbd369dfbbf320a81e3a208957fcc8ada29270f01efaefc18901d3c6
           # Cross-built: the x64 runner has the ARM64 MSVC tools.
           - os: windows-2022
             system: windows
             arch: arm64
             target: aarch64-pc-windows-msvc
             target_core: aarch64-pc-windows-msvc
-            sha256: RILL_SHA256_AARCH64_PC_WINDOWS_MSVC
+            sha256: ced4b753846622157f336cd41c7903f7140ba61849e8da0069fe30f8ed36fd88
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -86,9 +86,6 @@ jobs:
           sudo apt-get install -y libgtk-4-dev
 
       - name: Fetch rill
-        env:
-          # Reads rill's release while that repository is private; empty otherwise.
-          GH_TOKEN: ${{ secrets.RILL_TOKEN }}
         run: ./scripts/fetch-rill.sh "$RILL_VERSION" ${{ matrix.target_core }} ${{ matrix.sha256 }} "$(dirname "$CORE")"
 
       - name: Fetch Geo databases

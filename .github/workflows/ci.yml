@@ -25,15 +25,15 @@ jobs:
           - os: macos-15
             system: macos
             target_core: aarch64-apple-darwin
-            sha256: RILL_SHA256_AARCH64_APPLE_DARWIN
+            sha256: 175767afb91ff2daa62391edf0ae1aa51cdc0d9c57cf0ae7d6bcc43fe8214872
           - os: ubuntu-22.04
             system: linux
             target_core: x86_64-unknown-linux-musl
-            sha256: RILL_SHA256_X86_64_UNKNOWN_LINUX_MUSL
+            sha256: b41978cbe054424c917ba8016e8a62d38e0ec3bf501627383b4290a6a5033c6e
           - os: windows-2022
             system: windows
             target_core: x86_64-pc-windows-msvc
-            sha256: RILL_SHA256_X86_64_PC_WINDOWS_MSVC
+            sha256: ab8a0edadbd369dfbbf320a81e3a208957fcc8ada29270f01efaefc18901d3c6
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -60,9 +60,6 @@ jobs:
         run: cargo test --locked -- --test-threads=1
 
       - name: Package
-        env:
-          # Reads rill's release while that repository is private; empty otherwise.
-          GH_TOKEN: ${{ secrets.RILL_TOKEN }}
         run: |
           ./scripts/fetch-rill.sh "$RILL_VERSION" ${{ matrix.target_core }} ${{ matrix.sha256 }} "$(dirname "$CORE")"
           ./scripts/fetch-geo.sh "$RUNNER_TEMP/geo"
@@ -71,6 +68,20 @@ jobs:
             linux) ./scripts/build-linux.sh "$CORE" "$RUNNER_TEMP/geo" ;;
             windows) pwsh -File scripts/build-windows.ps1 -Core "$CORE" -Geo "$RUNNER_TEMP/geo" ;;
           esac
+
+      # The packaged app, for trying a change on a real Mac before it is released. ditto keeps
+      # the bundle's permissions and signatures, which the artifact upload alone would not.
+      - name: Keep the macOS app
+        if: matrix.system == 'macos'
+        run: ditto -c -k --keepParent dist/FlowBar.app FlowBar-macos-arm64.zip
+
+      - if: matrix.system == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlowBar-macos-arm64
+          path: FlowBar-macos-arm64.zip
+          retention-days: 14
+          if-no-files-found: error
 
       # Real interface actions against the packaged app and core; TUN stays off.
       - name: UI smoke test
