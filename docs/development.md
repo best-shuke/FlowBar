@@ -56,11 +56,11 @@ cargo test --locked -- --test-threads=1
 # 代理请求、DIRECT/REJECT、控制接口、配置检查
 python3 scripts/smoke-test.py
 
-# 窗口操作、节点选择、登录项注册和撤销
+# 窗口操作、节点选择、延迟测试、切换配置、登录项注册和撤销
 # Linux 需要显示器和 D-Bus，前面加上 xvfb-run -a dbus-run-session --
 python3 scripts/ui-smoke-test.py
 
-# Linux 托盘菜单
+# Linux 托盘菜单和延迟测试
 xvfb-run -a dbus-run-session -- python3 scripts/tray-smoke-test.py
 
 # macOS 和 Linux 的提权启动、错误传递和停止清理

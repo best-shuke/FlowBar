@@ -36,6 +36,7 @@ pub const GEO_NAMES: &[&str] = &[
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
+    /// The active profile, one of [`profiles`] once a profile is imported.
     pub profile_name: String,
     pub tun: bool,
     pub ipv6: bool,
@@ -45,7 +46,10 @@ pub struct Settings {
     pub mode: String,
     pub auto_connect: bool,
     pub auto_update: bool,
+    /// Node choices of the active profile.
     pub selections: BTreeMap<String, String>,
+    /// Node choices of the other profiles, restored when one becomes active again.
+    pub profile_selections: BTreeMap<String, BTreeMap<String, String>>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -60,15 +64,18 @@ impl Default for Settings {
             auto_connect: false,
             auto_update: true,
             selections: BTreeMap::new(),
+            profile_selections: BTreeMap::new(),
         }
     }
 }
 impl Settings {
     pub fn load() -> Self {
-        fs::read(home().join("settings.json"))
+        let mut settings = fs::read(home().join("settings.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        migrate_profile(&mut settings);
+        settings
     }
     pub fn save(&self) -> Result<()> {
         self.validate()?;
@@ -92,6 +99,96 @@ impl Settings {
             "分流模式无效。"
         );
         Ok(())
+    }
+    /// Makes `name` the active profile; each profile keeps its own node choices.
+    pub fn switch_profile(&mut self, name: &str) {
+        if self.profile_name == name {
+            return;
+        }
+        let selections = self.profile_selections.remove(name).unwrap_or_default();
+        let previous = std::mem::replace(&mut self.selections, selections);
+        let previous_name = std::mem::replace(&mut self.profile_name, name.into());
+        if !previous.is_empty() {
+            self.profile_selections.insert(previous_name, previous);
+        }
+    }
+    /// Deletes the active profile's copy and activates the first remaining profile.
+    pub fn remove_profile(&mut self) -> Result<()> {
+        match fs::remove_file(profile_path(&self.profile_name)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).context("无法删除配置文件");
+            }
+            _ => {}
+        }
+        self.selections.clear();
+        let next = profiles()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Settings::default().profile_name);
+        self.switch_profile(&next);
+        self.save()
+    }
+}
+
+/// Imported profiles, one YAML copy each, named after the profile.
+pub fn profiles_dir() -> PathBuf {
+    home().join("Profiles")
+}
+pub fn profile_path(name: &str) -> PathBuf {
+    profiles_dir().join(format!("{name}.yaml"))
+}
+/// The imported profiles' names, sorted.
+pub fn profiles() -> Vec<String> {
+    list_profiles(&profiles_dir())
+}
+fn list_profiles(directory: &Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            Some(name.strip_suffix(".yaml")?.to_owned())
+        })
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort();
+    names
+}
+/// A profile name that is also a file name on every system.
+pub fn profile_name(name: &str) -> String {
+    let name: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_control() || r#"/\:*?"<>|"#.contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if name.is_empty() {
+        "配置".into()
+    } else {
+        name
+    }
+}
+/// FlowBar 0.5 and earlier kept a single imported profile.yaml; it becomes the active
+/// profile in the profiles directory.
+fn migrate_profile(settings: &mut Settings) {
+    let legacy = home().join("profile.yaml");
+    if !legacy.is_file() {
+        return;
+    }
+    let name = profile_name(&settings.profile_name);
+    if private_dir(&profiles_dir()).is_ok()
+        && fs::rename(&legacy, profile_path(&name)).is_ok()
+        && name != settings.profile_name
+    {
+        settings.profile_name = name;
+        let _ = settings.save();
     }
 }
 
@@ -378,12 +475,18 @@ pub fn import_profile(source: &Path, name: Option<&str>) -> Result<Settings> {
     }
     copy_providers(&yaml, directory, &data)?;
     let mut settings = Settings::load();
-    settings.profile_name = name
-        .map(str::to_owned)
-        .unwrap_or_else(|| source.file_stem().unwrap().to_string_lossy().into());
+    // Importing a file again, for example after a subscription update, replaces its profile.
+    let name = profile_name(
+        &name
+            .map(str::to_owned)
+            .unwrap_or_else(|| source.file_stem().unwrap().to_string_lossy().into()),
+    );
+    private_dir(&profiles_dir())?;
+    private_write(&profile_path(&name), yaml.as_bytes())?;
+    settings.switch_profile(&name);
+    // The new copy may have renamed its groups and nodes.
     settings.selections.clear();
     settings.mode = "rule".into();
-    private_write(&home().join("profile.yaml"), yaml.as_bytes())?;
     settings.save()?;
     Ok(settings)
 }
@@ -511,6 +614,39 @@ mod tests {
         assert!(settings.auto_connect);
         assert_eq!(settings.proxy_port, 17891);
         assert!(settings.tun);
+    }
+    #[test]
+    fn profiles_keep_their_own_node_choices() {
+        let mut settings = Settings {
+            profile_name: "工作".into(),
+            ..Settings::default()
+        };
+        settings.selections.insert("代理".into(), "香港".into());
+        settings.switch_profile("家里");
+        assert_eq!(settings.profile_name, "家里");
+        assert!(settings.selections.is_empty());
+        settings.selections.insert("代理".into(), "东京".into());
+        settings.switch_profile("工作");
+        assert_eq!(settings.selections["代理"], "香港");
+        assert_eq!(settings.profile_selections["家里"]["代理"], "东京");
+        assert!(!settings.profile_selections.contains_key("工作"));
+        // Settings saved before profiles existed keep their node choices.
+        let saved: Settings =
+            serde_json::from_str(r#"{"profileName":"x","selections":{"a":"b"}}"#).unwrap();
+        assert!(saved.profile_selections.is_empty() && saved.selections["a"] == "b");
+    }
+    #[test]
+    fn lists_profiles_with_portable_names() {
+        let temporary = tempfile::tempdir().unwrap();
+        for name in ["b.yaml", "a.yaml", "notes.txt", ".yaml", ".flowbar-x"] {
+            fs::write(temporary.path().join(name), "").unwrap();
+        }
+        fs::create_dir(temporary.path().join("folder.yaml")).unwrap();
+        assert_eq!(list_profiles(temporary.path()), ["a", "b"]);
+        assert!(list_profiles(&temporary.path().join("missing")).is_empty());
+        assert_eq!(profile_name(" a/b:c\\d "), "a_b_c_d");
+        assert_eq!(profile_name("  "), "配置");
+        assert_eq!(profile_name("香港 · 01"), "香港 · 01");
     }
     #[test]
     fn imports_provider_and_rejects_traversal_and_symlinks() {

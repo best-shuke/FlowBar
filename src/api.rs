@@ -1,10 +1,15 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     time::Duration,
 };
+
+/// The latency test: the request the core sends through each node, and how long it waits.
+const DELAY_URL: &str = "http://www.gstatic.com/generate_204";
+const DELAY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct Api {
@@ -21,6 +26,25 @@ pub struct Group {
 
 impl Api {
     pub fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+        let (status, bytes) = self.exchange(method, path, body, Duration::from_secs(2))?;
+        ensure!(
+            (200..300).contains(&status),
+            "内核控制接口返回 HTTP {status}"
+        );
+        if bytes.is_empty() {
+            Ok(Value::Null)
+        } else {
+            Ok(serde_json::from_slice(&bytes)?)
+        }
+    }
+    /// Sends one request and returns the status and body; `timeout` bounds each read.
+    fn exchange(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        timeout: Duration,
+    ) -> Result<(u16, Vec<u8>)> {
         ensure!(
             path.starts_with('/')
                 && !path.contains(['\r', '\n'])
@@ -30,7 +54,7 @@ impl Api {
         let address = SocketAddr::from(([127, 0, 0, 1], self.port));
         let mut connection = TcpStream::connect_timeout(&address, Duration::from_millis(800))
             .context("无法连接内核")?;
-        connection.set_read_timeout(Some(Duration::from_secs(2)))?;
+        connection.set_read_timeout(Some(timeout))?;
         connection.set_write_timeout(Some(Duration::from_secs(2)))?;
         let bytes = body
             .map(|b| serde_json::to_vec(&b))
@@ -49,15 +73,25 @@ impl Api {
             .take(8 * 1024 * 1024 + 1)
             .read_to_end(&mut response)?;
         ensure!(response.len() <= 8 * 1024 * 1024, "控制接口响应过大");
-        let (status, bytes) = decode_response(&response)?;
-        ensure!(
-            (200..300).contains(&status),
-            "内核控制接口返回 HTTP {status}"
+        decode_response(&response)
+    }
+    /// Each member's latency in milliseconds, measured by the core through that member; it
+    /// tests a group's members concurrently. Members that failed or ran out of time are missing.
+    pub fn group_delay(&self, group: &str) -> Result<BTreeMap<String, u16>> {
+        let path = format!(
+            "/group/{}/delay?url={}&timeout={}",
+            encode_segment(group),
+            encode_segment(DELAY_URL),
+            DELAY_TIMEOUT.as_millis()
         );
-        if bytes.is_empty() {
-            Ok(Value::Null)
-        } else {
-            Ok(serde_json::from_slice(&bytes)?)
+        // The core answers once every member is done or the timeout has passed.
+        let (status, bytes) =
+            self.exchange("GET", &path, None, DELAY_TIMEOUT + Duration::from_secs(3))?;
+        match status {
+            200..300 => serde_json::from_slice(&bytes).context("延迟测试结果无效"),
+            // No member passed.
+            504 => Ok(BTreeMap::new()),
+            _ => bail!("内核控制接口返回 HTTP {status}"),
         }
     }
     pub fn select(&self, group: &str, choice: &str) -> Result<()> {
@@ -174,5 +208,41 @@ mod tests {
             decode_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nff\r\nx")
                 .is_err()
         );
+    }
+    #[test]
+    fn group_delay_reads_results_and_counts_a_timeout_as_none_passing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = Api {
+            port: listener.local_addr().unwrap().port(),
+            secret: "secret".into(),
+        };
+        let server = std::thread::spawn(move || {
+            let mut requests = vec![];
+            for response in [
+                "200 OK\r\n\r\n{\"香港 01\":120,\"DIRECT\":8}",
+                "504 Gateway Timeout\r\n\r\n{\"message\":\"Timeout\"}",
+                "404 Not Found\r\n\r\n{\"message\":\"resource not found\"}",
+            ] {
+                let (mut connection, _) = listener.accept().unwrap();
+                let mut request = vec![];
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let read = connection.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                write!(connection, "HTTP/1.1 {response}").unwrap();
+            }
+            requests
+        });
+        let delays = api.group_delay("节点 / 选择").unwrap();
+        assert_eq!(delays["香港 01"], 120);
+        assert_eq!(delays["DIRECT"], 8);
+        assert!(api.group_delay("节点 / 选择").unwrap().is_empty());
+        assert!(api.group_delay("节点 / 选择").is_err());
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with(
+            "GET /group/%E8%8A%82%E7%82%B9%20%2F%20%E9%80%89%E6%8B%A9/delay?url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=5000 HTTP/1.1\r\n"
+        ));
     }
 }

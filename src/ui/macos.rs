@@ -8,15 +8,15 @@ use crate::{
 use anyhow::{Result, ensure};
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
     runtime::{AnyObject, ProtocolObject},
     sel,
 };
 use objc2_app_kit::*;
 use objc2_foundation::{
-    NSArray, NSDictionary, NSDistributedNotificationCenter, NSNotification, NSObject,
-    NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    NSArray, NSAttributedString, NSDictionary, NSDistributedNotificationCenter, NSNotification,
+    NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 use objc2_quartz_core::kCACornerCurveContinuous;
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
@@ -36,7 +36,7 @@ const FOOTER_MIDLINE: f64 = 470.0;
 static DELEGATE: AtomicPtr<Delegate> = AtomicPtr::new(std::ptr::null_mut());
 struct Window {
     native: Retained<NSWindow>,
-    profile: Retained<NSTextField>,
+    profiles: Retained<NSPopUpButton>,
     stats: Retained<NSTextField>,
     import: Retained<NSButton>,
     reveal: Retained<NSButton>,
@@ -109,6 +109,10 @@ define_class!(
         fn connection_button(&self, _sender: &AnyObject) { self.perform(Action::Connect); }
         #[unsafe(method(importYaml:))]
         fn import_button(&self, _sender: &AnyObject) { self.perform(Action::Import); }
+        #[unsafe(method(profileChosen:))]
+        fn profile_list(&self, sender: &NSPopUpButton) {
+            if let Some(name) = sender.titleOfSelectedItem() { self.perform(Action::Profile(name.to_string())); }
+        }
         #[unsafe(method(optionsChanged:))]
         fn options_button(&self, _sender: &AnyObject) {
             let app = &self.ivars().app;
@@ -234,10 +238,29 @@ impl Shell for Delegate {
             return;
         };
         let text = |value: &str| NSString::from_str(value);
-        let name = text(&view.profile);
-        window.profile.setStringValue(&name);
+        let titles = window.profiles.itemTitles();
+        let shown: Vec<_> = (0..titles.count())
+            .map(|index| titles.objectAtIndex(index).to_string())
+            .collect();
+        if shown != view.profiles {
+            window.profiles.removeAllItems();
+            let names: Vec<_> = view.profiles.iter().map(|name| text(name)).collect();
+            window
+                .profiles
+                .addItemsWithTitles(&NSArray::from_retained_slice(&names));
+        }
+        // An index of -1 selects nothing.
+        window
+            .profiles
+            .selectItemAtIndex(view.profile_index.map_or(-1, |index| index as isize));
+        window.profiles.setEnabled(view.switchable);
         // The name may be truncated.
-        window.profile.setToolTip(view.imported.then_some(&*name));
+        window.profiles.setToolTip(
+            view.imported
+                .then(|| window.profiles.titleOfSelectedItem())
+                .flatten()
+                .as_deref(),
+        );
         window.stats.setStringValue(&text(&view.stats));
         window.import.setEnabled(view.editable);
         window.reveal.setEnabled(view.imported);
@@ -373,11 +396,12 @@ impl Shell for Delegate {
         }
         usize::try_from(alert.runModal() - NSAlertFirstButtonReturn).unwrap_or(buttons.len())
     }
-    /// Shows groups fetched after the menu opened. Groups with the same names and choices
-    /// are updated in place, so a submenu the user is browsing stays open.
+    /// Shows groups fetched after the menu opened, and latencies measured meanwhile. Groups
+    /// with the same names and choices are updated in place, so a submenu the user is
+    /// browsing stays open.
     fn groups_changed(&self) {
         let groups = self.ivars().app.ui.borrow().groups.clone();
-        let enabled = self.ivars().app.menu_enabled();
+        let entries = self.ivars().app.group_entries();
         let mut mac = self.ivars().mac.borrow_mut();
         let Some((menu, shown)) = mac.groups_menu.as_mut() else {
             return;
@@ -388,21 +412,17 @@ impl Shell for Delegate {
             });
         if !same_shape {
             menu.removeAllItems();
-            self.add_entries(menu, super::group_entries(&groups, enabled), &mut None);
+            self.add_entries(menu, entries, &mut None);
         } else {
-            for (index, group) in groups.iter().enumerate() {
-                let Some(item) = menu.itemAtIndex(index as isize) else {
+            for (index, entry) in entries.into_iter().enumerate() {
+                let (Some(item), Entry::Menu { title, entries, .. }) =
+                    (menu.itemAtIndex(index as isize), entry)
+                else {
                     continue;
                 };
-                item.setTitle(&NSString::from_str(&super::group_title(group)));
-                let Some(choices) = item.submenu() else {
-                    continue;
-                };
-                for (position, choice) in group.choices.iter().enumerate() {
-                    if let Some(entry) = choices.itemAtIndex(position as isize) {
-                        entry.setEnabled(enabled && super::selectable(group));
-                        entry.setState(i64::from(&group.current == choice) as _);
-                    }
+                item.setTitle(&NSString::from_str(&title));
+                if let Some(submenu) = item.submenu() {
+                    update_items(&submenu, &entries);
                 }
             }
         }
@@ -481,17 +501,22 @@ impl Delegate {
         groups_menu: &mut Option<Retained<NSMenu>>,
     ) {
         let mtm = self.mtm();
+        let tab = tab_location(&entries);
         for entry in entries {
             match entry {
                 Entry::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
                 Entry::Item {
                     title,
+                    detail,
                     action,
                     enabled,
                     checked,
                 } => {
                     let quit = matches!(action, Some(Action::Quit));
                     let item = self.item(&title, action, enabled, checked.unwrap_or(false));
+                    if detail.is_some() {
+                        set_title(&item, &title, detail.as_deref(), tab);
+                    }
                     if quit {
                         item.setKeyEquivalent(&NSString::from_str("q"));
                     }
@@ -598,14 +623,16 @@ impl Delegate {
         };
 
         section("配置", 16.0, 72.0);
-        let profile = self.label(
-            &view,
-            "",
-            &NSFont::systemFontOfSize_weight(13.0, semibold),
+        let profiles = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(mtm),
+            rect(31.0, 47.0, 170.0, 26.0),
             false,
-            1,
-            rect(34.0, 51.0, 168.0, 18.0),
         );
+        unsafe {
+            profiles.setTarget(Some(self));
+            profiles.setAction(Some(sel!(profileChosen:)));
+        }
+        view.addSubview(&profiles);
         let import = add(self.button(
             "导入 YAML…",
             sel!(importYaml:),
@@ -717,7 +744,7 @@ impl Delegate {
         self.ivars().app.load_summary();
         self.ivars().mac.borrow_mut().window = Some(Window {
             native,
-            profile,
+            profiles,
             stats,
             import,
             reveal,
@@ -836,6 +863,86 @@ fn update_ticks(emit: Emit, delay: Duration) {
         emit(Event::Update(update::Event::Due));
         update_ticks(emit, Duration::from_secs(3600));
     });
+}
+/// Updates the items of an open menu from entries of the same shape.
+fn update_items(menu: &NSMenu, entries: &[Entry]) {
+    let tab = tab_location(entries);
+    for (index, entry) in entries.iter().enumerate() {
+        let (
+            Some(item),
+            Entry::Item {
+                title,
+                detail,
+                enabled,
+                checked,
+                ..
+            },
+        ) = (menu.itemAtIndex(index as isize), entry)
+        else {
+            continue;
+        };
+        set_title(&item, title, detail.as_deref(), tab);
+        item.setEnabled(*enabled);
+        item.setState(i64::from(checked.unwrap_or(false)) as _);
+    }
+}
+/// A menu item's title, with `detail`, such as a node's latency, right-aligned at `tab`.
+fn set_title(item: &NSMenuItem, title: &str, detail: Option<&str>, tab: f64) {
+    let Some(detail) = detail else {
+        item.setAttributedTitle(None);
+        item.setTitle(&NSString::from_str(title));
+        return;
+    };
+    let stop = unsafe {
+        NSTextTab::initWithTextAlignment_location_options(
+            NSTextTab::alloc(),
+            NSTextAlignment::Right,
+            tab,
+            &NSDictionary::new(),
+        )
+    };
+    let style = NSMutableParagraphStyle::new();
+    style.setTabStops(Some(&NSArray::from_retained_slice(&[stop])));
+    item.setAttributedTitle(Some(&menu_text(
+        &format!("{title}\t{detail}"),
+        Some(&style),
+    )));
+}
+/// Where the details of a menu's items end: past its widest title and detail, and a gap.
+fn tab_location(entries: &[Entry]) -> f64 {
+    let width = |text: &str| menu_text(text, None).size().width;
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Item {
+                title,
+                detail: Some(detail),
+                ..
+            } => Some(width(title) + width(detail)),
+            _ => None,
+        })
+        .fold(0.0, f64::max)
+        + 24.0
+}
+/// Text in the menu font, which an attributed title does not use by default.
+fn menu_text(text: &str, style: Option<&NSParagraphStyle>) -> Retained<NSAttributedString> {
+    let font = NSFont::menuFontOfSize(0.0);
+    let font: &AnyObject = &font;
+    let (font_key, style_key) = unsafe { (NSFontAttributeName, NSParagraphStyleAttributeName) };
+    let mut keys = vec![font_key];
+    let mut values = vec![font];
+    if let Some(style) = style {
+        keys.push(style_key);
+        values.push(style);
+    }
+    let attributes = NSDictionary::from_slices(&keys, &values);
+    unsafe {
+        NSAttributedString::initWithString_attributes(
+            NSAttributedString::alloc(),
+            &NSString::from_str(text),
+            Some(&attributes),
+        )
+    }
 }
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))

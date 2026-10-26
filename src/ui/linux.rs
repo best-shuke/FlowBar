@@ -23,7 +23,6 @@ const CSS: &str = "
     padding: 12px 14px;
 }
 .flowbar-secondary { font-size: smaller; opacity: 0.7; }
-.flowbar-profile { font-weight: bold; }
 .flowbar-port { font-feature-settings: \"tnum\"; }
 .flowbar-dot { font-size: 9px; }
 .flowbar-dot.stopped { opacity: 0.3; }
@@ -65,7 +64,7 @@ struct Linux {
 #[derive(Clone)]
 struct Window {
     native: gtk::ApplicationWindow,
-    profile: gtk::Label,
+    profiles: gtk::DropDown,
     stats: gtk::Label,
     import: gtk::Button,
     reveal: gtk::Button,
@@ -93,10 +92,27 @@ impl Shell for Linux {
         };
         let reset_ports = self.app.take_reset_ports();
         self.rendering.set(true);
-        window.profile.set_text(&view.profile);
-        window
-            .profile
-            .set_tooltip_text(view.imported.then_some(view.profile.as_str()));
+        let shown = window
+            .profiles
+            .model()
+            .and_downcast::<gtk::StringList>()
+            .map(|list| {
+                (0..list.n_items())
+                    .filter_map(|index| list.string(index))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if shown != view.profiles {
+            let names: Vec<_> = view.profiles.iter().map(String::as_str).collect();
+            window
+                .profiles
+                .set_model(Some(&gtk::StringList::new(&names)));
+        }
+        window.profiles.set_selected(
+            view.profile_index
+                .map_or(gtk::INVALID_LIST_POSITION, |index| index as u32),
+        );
+        window.profiles.set_sensitive(view.switchable);
         window.stats.set_text(&view.stats);
         window.import.set_sensitive(view.editable);
         window.reveal.set_sensitive(view.imported);
@@ -383,12 +399,10 @@ impl Linux {
 
         let card = section("配置", None);
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let profile = label("", "flowbar-profile");
-        profile.set_hexpand(true);
-        profile.set_ellipsize(pango::EllipsizeMode::End);
+        let profiles = profile_list();
         let import = button("导入 YAML…", Action::Import);
         let reveal = button("打开所在文件夹", Action::Reveal);
-        row.append(&profile);
+        row.append(&profiles);
         row.append(&import);
         row.append(&reveal);
         card.append(&row);
@@ -489,7 +503,7 @@ impl Linux {
         });
         Window {
             native,
-            profile,
+            profiles,
             stats,
             import,
             reveal,
@@ -522,6 +536,53 @@ fn hint() -> gtk::Label {
     hint.set_max_width_chars(40);
     hint.set_margin_start(28);
     hint
+}
+/// The profile choice. Its button shortens long names so they cannot widen the window;
+/// the list shows them in full.
+fn profile_list() -> gtk::DropDown {
+    let factory = |ellipsize: bool| {
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(move |_, item| {
+            let label = gtk::Label::new(None);
+            label.set_xalign(0.0);
+            if ellipsize {
+                label.set_ellipsize(pango::EllipsizeMode::End);
+                label.set_max_width_chars(16);
+            }
+            if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
+                item.set_child(Some(&label));
+            }
+        });
+        factory.connect_bind(|_, item| {
+            let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                return;
+            };
+            if let (Some(label), Some(name)) = (
+                item.child().and_downcast::<gtk::Label>(),
+                item.item().and_downcast::<gtk::StringObject>(),
+            ) {
+                label.set_text(&name.string());
+            }
+        });
+        factory
+    };
+    let list = gtk::DropDown::new(None::<gtk::StringList>, None::<gtk::Expression>);
+    list.set_factory(Some(&factory(true)));
+    list.set_list_factory(Some(&factory(false)));
+    list.set_hexpand(true);
+    list.set_valign(gtk::Align::Center);
+    list.connect_selected_notify(|list| {
+        let name = list
+            .selected_item()
+            .and_downcast::<gtk::StringObject>()
+            .map(|name| name.string().to_string());
+        with_shell(|shell| {
+            if let Some(name) = name.filter(|_| !shell.rendering.get()) {
+                post(Action::Profile(name));
+            }
+        })
+    });
+    list
 }
 fn button(title: &str, action: Action) -> gtk::Button {
     let button = gtk::Button::with_label(title);
@@ -607,10 +668,16 @@ fn menu_items(entries: &[Entry]) -> Vec<ksni::MenuItem<Tray>> {
             Entry::Separator => ksni::MenuItem::Separator,
             Entry::Item {
                 title,
+                detail,
                 action,
                 enabled,
                 checked,
             } => {
+                // Hosts show the text after a tab at the right edge, or at least set apart.
+                let label = match detail {
+                    Some(detail) => format!("{}\t{detail}", menu_label(title)),
+                    None => menu_label(title),
+                };
                 let action = action.clone();
                 let activate = Box::new(move |_: &mut Tray| {
                     if let Some(action) = &action {
@@ -619,7 +686,7 @@ fn menu_items(entries: &[Entry]) -> Vec<ksni::MenuItem<Tray>> {
                 });
                 match checked {
                     Some(checked) => CheckmarkItem {
-                        label: menu_label(title),
+                        label,
                         enabled: *enabled,
                         checked: *checked,
                         activate,
@@ -627,7 +694,7 @@ fn menu_items(entries: &[Entry]) -> Vec<ksni::MenuItem<Tray>> {
                     }
                     .into(),
                     None => StandardItem {
-                        label: menu_label(title),
+                        label,
                         enabled: *enabled,
                         activate,
                         ..Default::default()

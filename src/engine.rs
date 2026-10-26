@@ -7,6 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -28,6 +29,14 @@ pub enum Event {
     Groups(String, Vec<Group>),
     Mode(String, String),
     Selection(String, String, String, Vec<Group>),
+    /// A group's latency test: each passing member's delay in milliseconds, and the groups
+    /// after it, since testing a url-test group can change its pick.
+    Delays(
+        String,
+        String,
+        Result<BTreeMap<String, u16>, String>,
+        Vec<Group>,
+    ),
     Error(String),
     Update(update::Event),
 }
@@ -80,7 +89,7 @@ impl Run {
         });
     }
     pub fn group_order(&self) -> Vec<String> {
-        fs::read_to_string(config::home().join("profile.yaml"))
+        fs::read_to_string(config::profile_path(&self.settings.profile_name))
             .ok()
             .and_then(|y| config::summary(&y).ok())
             .map(|s| s.groups)
@@ -154,7 +163,7 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
         );
     }
     emit(Event::Progress(run.id.clone(), "正在检查配置…".into()));
-    let yaml = fs::read_to_string(config::home().join("profile.yaml"))
+    let yaml = fs::read_to_string(config::profile_path(&run.settings.profile_name))
         .map_err(|_| anyhow::anyhow!("请先导入完整的 YAML 配置。"))?;
     let runtime = config::runtime(&yaml, &run.settings, &run.api.secret)?;
     let config_file = run.stage.join("config.yaml");

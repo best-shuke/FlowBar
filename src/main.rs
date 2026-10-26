@@ -60,8 +60,9 @@ fn entry() -> Result<()> {
                 Path::new(&arguments[1]),
                 arguments.get(2).map(String::as_str),
             )?;
-            let summary =
-                config::summary(&fs::read_to_string(config::home().join("profile.yaml"))?)?;
+            let summary = config::summary(&fs::read_to_string(config::profile_path(
+                &settings.profile_name,
+            ))?)?;
             println!(
                 "已导入 {}：{} 个节点，{} 个策略组，{} 条规则。",
                 settings.profile_name,

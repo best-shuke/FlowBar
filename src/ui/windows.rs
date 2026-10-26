@@ -57,23 +57,25 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             AllowSetForegroundWindow, AppendMenuW, BM_GETCHECK, BM_SETCHECK, BN_CLICKED,
-            BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT, CreateIconIndirect, CreatePopupMenu,
-            CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyIcon, DestroyMenu, DestroyWindow,
-            DispatchMessageW, EN_KILLFOCUS, ES_AUTOHSCROLL, ES_NUMBER, FindWindowW, GetDlgCtrlID,
-            GetDlgItem, GetMenuItemCount, GetMessageW, GetSystemMetrics, GetWindowTextLengthW,
-            GetWindowTextW, GetWindowThreadProcessId, HICON, HMENU, ICONINFO, IDC_ARROW, IDCANCEL,
-            IDOK, IMAGE_ICON, IsDialogMessageW, IsIconic, KillTimer, LR_DEFAULTCOLOR, LoadCursorW,
-            LoadImageW, MB_OK, MB_OKCANCEL, MB_SETFOREGROUND, MF_BYPOSITION, MF_CHECKED, MF_GRAYED,
-            MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, NONCLIENTMETRICSW,
-            PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SM_CXICON,
-            SM_CXSMICON, SPI_GETNONCLIENTMETRICS, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
-            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer,
-            SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-            TrackPopupMenuEx, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
-            WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND,
-            WM_INITMENUPOPUP, WM_NCDESTROY, WM_NULL, WM_PAINT, WM_PRINTCLIENT, WM_SETFONT,
-            WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
-            WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+            BS_AUTOCHECKBOX, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT,
+            CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, CW_USEDEFAULT, CreateIconIndirect,
+            CreatePopupMenu, CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyIcon, DestroyMenu,
+            DestroyWindow, DispatchMessageW, EN_KILLFOCUS, ES_AUTOHSCROLL, ES_NUMBER, FindWindowW,
+            GetDlgCtrlID, GetDlgItem, GetMenuItemCount, GetMessageW, GetSystemMetrics,
+            GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HICON, HMENU, ICONINFO,
+            IDC_ARROW, IDCANCEL, IDOK, IMAGE_ICON, IsDialogMessageW, IsIconic, KillTimer,
+            LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MB_OK, MB_OKCANCEL, MB_SETFOREGROUND,
+            MF_BYPOSITION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+            MessageBoxW, MoveWindow, NONCLIENTMETRICSW, PostMessageW, PostQuitMessage,
+            RegisterClassExW, RegisterWindowMessageW, SM_CXICON, SM_CXSMICON,
+            SPI_GETNONCLIENTMETRICS, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE,
+            SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos,
+            SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+            TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLORBTN,
+            WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_INITMENUPOPUP,
+            WM_NCDESTROY, WM_NULL, WM_PAINT, WM_PRINTCLIENT, WM_SETFONT, WM_TIMER, WNDCLASSEXW,
+            WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED,
+            WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
         },
     },
 };
@@ -134,7 +136,8 @@ const VERSION: i32 = 118;
 const LABELS: i32 = 130;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    Bold,
+    /// A drop-down list; its height includes the open list.
+    Choice,
     Caption,
     Secondary,
     Wrapped,
@@ -162,7 +165,7 @@ const fn control(id: i32, kind: Kind, text: &'static str, rect: [i32; 4], card: 
 }
 const CONTROLS: &[Control] = &[
     control(LABELS, Kind::Caption, "配置", [34, 16, 200, 16], false),
-    control(PROFILE, Kind::Bold, "", [34, 50, 148, 20], true),
+    control(PROFILE, Kind::Choice, "", [34, 47, 148, 200], true),
     control(IMPORT, Kind::Button, "导入 YAML…", [186, 45, 106, 28], true),
     control(
         REVEAL,
@@ -258,13 +261,14 @@ struct Window {
     window_brush: HBRUSH,
     card_brush: HBRUSH,
     phase: Phase,
+    /// The profile names in the drop-down list.
+    profiles: Vec<String>,
     /// Top of the status dot, in physical pixels; it follows the status text's first line.
     dot_top: i32,
 }
 #[derive(Clone, Copy)]
 struct Fonts {
     normal: HFONT,
-    bold: HFONT,
     small: HFONT,
     caption: HFONT,
 }
@@ -292,7 +296,27 @@ impl Shell for Win {
         };
         let reset_ports = self.app.take_reset_ports();
         let item = |id| unsafe { GetDlgItem(hwnd, id) };
-        set_text(item(PROFILE), &view.profile);
+        let profiles = item(PROFILE);
+        // Refilling the list only when it changes keeps an open list from closing. The list
+        // may send messages back, so the window state is not borrowed meanwhile.
+        let changed = match self.window.borrow_mut().as_mut() {
+            Some(window) if window.profiles != view.profiles => {
+                window.profiles = view.profiles.clone();
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            unsafe { SendMessageW(profiles, CB_RESETCONTENT, 0, 0) };
+            for name in &view.profiles {
+                let name = wide(name);
+                unsafe { SendMessageW(profiles, CB_ADDSTRING, 0, name.as_ptr() as LPARAM) };
+            }
+        }
+        // An index of -1 selects nothing.
+        let index = view.profile_index.unwrap_or(usize::MAX);
+        unsafe { SendMessageW(profiles, CB_SETCURSEL, index, 0) };
+        enable(profiles, view.switchable);
         set_text(item(STATS), &view.stats);
         enable(item(IMPORT), view.editable);
         enable(item(REVEAL), view.imported);
@@ -563,13 +587,12 @@ impl Win {
         let Some(popup) = popup.as_mut().filter(|popup| popup.groups == menu) else {
             return;
         };
-        let groups = self.app.ui.borrow().groups.clone();
         unsafe {
             while GetMenuItemCount(menu) > 0 {
                 DeleteMenu(menu, 0, MF_BYPOSITION);
             }
         }
-        for entry in super::group_entries(&groups, self.app.menu_enabled()) {
+        for entry in self.app.group_entries() {
             append(menu, &entry, popup);
         }
     }
@@ -608,6 +631,11 @@ impl Win {
         }
         for control in CONTROLS {
             let (class, style, extended) = match control.kind {
+                Kind::Choice => (
+                    "COMBOBOX",
+                    WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
+                    0,
+                ),
                 Kind::Button => ("BUTTON", WS_TABSTOP | BS_PUSHBUTTON as u32, 0),
                 Kind::Check => ("BUTTON", WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0),
                 Kind::Port => (
@@ -654,6 +682,7 @@ impl Win {
             window_brush: unsafe { CreateSolidBrush(colors.window) },
             card_brush: unsafe { CreateSolidBrush(colors.card) },
             phase: Phase::Stopped,
+            profiles: vec![],
             dot_top: 0,
         });
         self.layout(hwnd, None);
@@ -669,7 +698,6 @@ impl Win {
         let scale = |value: i32| scale(value, dpi);
         for control in CONTROLS {
             let font = match control.kind {
-                Kind::Bold => fonts.bold,
                 Kind::Caption => fonts.caption,
                 Kind::Secondary | Kind::Wrapped => fonts.small,
                 _ => fonts.normal,
@@ -829,6 +857,19 @@ impl Win {
     }
     fn command(&self, id: i32, code: u32) {
         match (id, code) {
+            (PROFILE, CBN_SELCHANGE) => {
+                let Some(hwnd) = self.settings_hwnd() else {
+                    return;
+                };
+                let index = unsafe { SendMessageW(GetDlgItem(hwnd, PROFILE), CB_GETCURSEL, 0, 0) };
+                let name = usize::try_from(index).ok().and_then(|index| {
+                    let window = self.window.borrow();
+                    window.as_ref()?.profiles.get(index).cloned()
+                });
+                if let Some(name) = name {
+                    self.perform(Action::Profile(name));
+                }
+            }
             (IMPORT, BN_CLICKED) => self.perform(Action::Import),
             (REVEAL, BN_CLICKED) => self.perform(Action::Reveal),
             (TUN | AUTO | AUTO_UPDATE, BN_CLICKED) => self.app.commit(self),
@@ -922,13 +963,12 @@ impl Fonts {
         };
         Self {
             normal: make(1.0, false),
-            bold: make(1.0, true),
             small: make(0.92, false),
             caption: make(0.92, true),
         }
     }
     fn delete(self) {
-        for font in [self.normal, self.bold, self.small, self.caption] {
+        for font in [self.normal, self.small, self.caption] {
             unsafe { DeleteObject(font) };
         }
     }
@@ -1008,14 +1048,22 @@ fn text_height(hwnd: HWND, font: HFONT, value: &str, width: i32) -> i32 {
     rect.bottom
 }
 fn append(menu: HMENU, entry: &Entry, popup: &mut Popup) {
-    // An ampersand marks an access key in menu text.
-    let label = |title: &str| wide(title.replace('&', "&&"));
+    // An ampersand marks an access key in menu text; text after a tab is right-aligned.
+    let label = |title: &str, detail: Option<&str>| {
+        let mut text = title.replace('&', "&&");
+        if let Some(detail) = detail {
+            text.push('\t');
+            text.push_str(detail);
+        }
+        wide(text)
+    };
     match entry {
         Entry::Separator => unsafe {
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
         },
         Entry::Item {
             title,
+            detail,
             action,
             enabled,
             checked,
@@ -1031,7 +1079,7 @@ fn append(menu: HMENU, entry: &Entry, popup: &mut Popup) {
                 popup.actions.push(action.clone());
                 popup.actions.len()
             });
-            unsafe { AppendMenuW(menu, flags, id, label(title).as_ptr()) };
+            unsafe { AppendMenuW(menu, flags, id, label(title, detail.as_deref()).as_ptr()) };
         }
         Entry::Menu {
             title,
@@ -1045,7 +1093,14 @@ fn append(menu: HMENU, entry: &Entry, popup: &mut Popup) {
             if *groups {
                 popup.groups = submenu;
             }
-            unsafe { AppendMenuW(menu, MF_POPUP, submenu as usize, label(title).as_ptr()) };
+            unsafe {
+                AppendMenuW(
+                    menu,
+                    MF_POPUP,
+                    submenu as usize,
+                    label(title, None).as_ptr(),
+                )
+            };
         }
     }
 }

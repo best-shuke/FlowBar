@@ -128,13 +128,20 @@ with tempfile.TemporaryDirectory(prefix='flowbar-tray-') as temp:
         # The item registers before the app shows its first state.
         assert pump(5, lambda: tooltip() == 'FlowBar · 已停止'), tooltip()
         menu = item_property(service, path, 'Menu')
-        assert {'启动连接', '分流模式', '使用 TUN', '退出 FlowBar'} <= set(layout(service, menu))
-        print('PASS tray registers with icon, tooltip and menu')
+        assert {'启动连接', '配置：托盘测试', '托盘测试', '分流模式', '使用 TUN', '退出 FlowBar'} <= set(layout(service, menu))
+        print('PASS tray registers with icon, tooltip, profiles and menu')
 
         click(service, menu, '启动连接')
         assert pump(30, lambda: tooltip() == 'FlowBar · 本地代理已启动'), tooltip()
         call(service, menu, 'com.canonical.dbusmenu', 'AboutToShow', GLib.Variant('(i)', (0,)))
         assert pump(10, lambda: '策略组与节点' in layout(service, menu)), 'Groups did not appear'
+        # Latencies appear only after a test, which the core runs for a whole group.
+        delays = lambda: [label for label in layout(service, menu) if '\t' in label]
+        assert not delays() and '测试延迟' in layout(service, menu)
+        click(service, menu, '测试延迟')
+        assert pump(15, lambda: any(label.startswith('REJECT\t') for label in delays())), delays()
+        assert any(label == 'REJECT\t超时' for label in delays()), delays()
+        print('PASS tray menu tests node latency on request')
         click(service, menu, '全局代理')
         settings = data / 'settings.json'
         assert pump(10, lambda: json.loads(settings.read_text())['mode'] == 'global')

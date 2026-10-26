@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
@@ -80,6 +81,11 @@ pub enum Action {
     AutoUpdate,
     Mode(String),
     Select(String, String),
+    /// Makes another imported profile active.
+    Profile(String),
+    RemoveProfile,
+    /// Tests the latency of a group's members.
+    Delay(String),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Login {
@@ -98,6 +104,8 @@ pub fn login_status() -> Login {
 pub enum Entry {
     Item {
         title: String,
+        /// Text at the right edge, such as a node's latency.
+        detail: Option<String>,
         action: Option<Action>,
         enabled: bool,
         checked: Option<bool>,
@@ -114,6 +122,7 @@ pub enum Entry {
 fn item(title: &str, action: Option<Action>, enabled: bool, checked: Option<bool>) -> Entry {
     Entry::Item {
         title: title.into(),
+        detail: None,
         action,
         enabled,
         checked,
@@ -123,7 +132,11 @@ fn item(title: &str, action: Option<Action>, enabled: bool, checked: Option<bool
 /// What the settings window shows.
 pub struct View {
     pub imported: bool,
-    pub profile: String,
+    /// The settings window's profile list, the active profile's position in it, and whether
+    /// another one can be chosen now. Without profiles it holds a disabled placeholder.
+    pub profiles: Vec<String>,
+    pub profile_index: Option<usize>,
+    pub switchable: bool,
     pub stats: String,
     /// Import, TUN and the ports can change only while stopped.
     pub editable: bool,
@@ -167,8 +180,8 @@ pub trait Shell {
     /// Shows a modal message and returns the index of the clicked button; without
     /// buttons it offers a single OK. A dismissed alert returns `buttons.len()`.
     fn alert(&self, title: &str, message: &str, buttons: &[&str]) -> usize;
-    /// The groups changed while the status menu may be open; the status item's menu
-    /// shows them, but the settings window does not.
+    /// The groups or their latencies changed while the status menu may be open; the status
+    /// item's menu shows them, but the settings window does not.
     fn groups_changed(&self) {}
     /// Sends [`update::Event::Due`] after ten seconds and then hourly.
     fn schedule_updates(&self);
@@ -181,6 +194,14 @@ pub struct Ui {
     pub phase: Phase,
     pub message: String,
     pub groups: Vec<Group>,
+    /// Imported profile names, read at launch and after an import or removal.
+    pub profiles: Vec<String>,
+    /// Latencies from the last tests, in milliseconds; `None` for a node that failed.
+    pub delays: HashMap<String, Option<u16>>,
+    /// Groups whose latency test is running.
+    testing: HashSet<String>,
+    /// Connect again once the connection has stopped, after switching profiles.
+    reconnect: bool,
     pub run: Option<Arc<Run>>,
     log: Option<PathBuf>,
     /// Profile counts, parsed when the settings window opens and after an import, not on every render.
@@ -193,6 +214,22 @@ pub struct Ui {
     checked: Option<SystemTime>,
     smoke_step: Option<u8>,
 }
+impl Ui {
+    /// Menu actions are available while no connection change or menu operation is pending.
+    fn menu_enabled(&self) -> bool {
+        !matches!(self.phase, Phase::Starting | Phase::Stopping) && !self.operation
+    }
+    /// Forgets the state of a connection that has ended.
+    fn end_run(&mut self) {
+        self.log = self.run.as_ref().map(|r| r.log());
+        self.run = None;
+        self.groups.clear();
+        self.delays.clear();
+        self.testing.clear();
+        self.refreshing = false;
+        self.operation = false;
+    }
+}
 impl Default for Ui {
     fn default() -> Self {
         Self {
@@ -200,6 +237,10 @@ impl Default for Ui {
             phase: Phase::Stopped,
             message: "已停止".into(),
             groups: vec![],
+            profiles: config::profiles(),
+            delays: HashMap::new(),
+            testing: HashSet::new(),
+            reconnect: false,
             run: None,
             log: None,
             summary: None,
@@ -265,7 +306,7 @@ impl App {
         let snapshot = arguments.iter().position(|a| a == "--snapshot");
         if snapshot.is_some()
             || arguments.iter().any(|a| a == "--show-settings")
-            || !config::home().join("profile.yaml").exists()
+            || !config::profile_path(&self.ui.borrow().settings.profile_name).exists()
         {
             shell.show_settings();
         }
@@ -291,15 +332,10 @@ impl App {
     pub fn stopped(&self) -> bool {
         matches!(self.ui.borrow().phase, Phase::Stopped | Phase::Failed)
     }
-    /// Menu actions are available while no connection change or menu operation is pending.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
-    pub fn menu_enabled(&self) -> bool {
-        let ui = self.ui.borrow();
-        !matches!(ui.phase, Phase::Starting | Phase::Stopping) && !ui.operation
-    }
     /// Reloads the profile counts shown in a newly opened settings window.
     pub fn load_summary(&self) {
-        self.ui.borrow_mut().summary = profile_summary();
+        let mut ui = self.ui.borrow_mut();
+        ui.summary = profile_summary(&ui.settings.profile_name);
     }
     /// Whether the settings window should overwrite its port fields even while one is being
     /// edited, after a failed save. Only that window's render may take it.
@@ -320,7 +356,10 @@ impl App {
             Action::Connect => self.connect(shell)?,
             Action::Settings => shell.show_settings(),
             Action::Import => self.import(shell)?,
-            Action::Reveal => sys::open(&config::home().join("profile.yaml"), true),
+            Action::Reveal => {
+                let path = config::profile_path(&self.ui.borrow().settings.profile_name);
+                sys::open(&path, true)
+            }
             Action::Quit => shell.quit(),
             Action::Login => sys::toggle_login()?,
             Action::Logs => {
@@ -394,8 +433,74 @@ impl App {
                     });
                 }
             }
+            Action::Profile(name) => self.switch_profile(shell, &name)?,
+            Action::RemoveProfile => self.remove_profile(shell)?,
+            Action::Delay(group) => {
+                let run = {
+                    let mut ui = self.ui.borrow_mut();
+                    match ui.run.clone() {
+                        Some(run)
+                            if ui.phase == Phase::Running && ui.testing.insert(group.clone()) =>
+                        {
+                            Some(run)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(run) = run {
+                    let emit = self.emit.clone();
+                    thread::spawn(move || {
+                        let delays = run.api.group_delay(&group).map_err(|e| e.to_string());
+                        let groups = run.api.groups(&run.group_order()).unwrap_or_default();
+                        emit(Event::Delays(run.id.clone(), group, delays, groups));
+                    });
+                }
+            }
         }
         shell.render();
+        Ok(())
+    }
+    /// Makes another imported profile active; a running connection restarts with it.
+    fn switch_profile(&self, shell: &dyn Shell, name: &str) -> Result<()> {
+        let running = {
+            let ui = self.ui.borrow();
+            ensure!(ui.menu_enabled(), "连接正在处理中。");
+            if ui.settings.profile_name == name || !ui.profiles.iter().any(|p| p == name) {
+                return Ok(());
+            }
+            ui.phase == Phase::Running
+        };
+        let mut settings = self.ui.borrow().settings.clone();
+        settings.switch_profile(name);
+        settings.save()?;
+        {
+            let mut ui = self.ui.borrow_mut();
+            ui.summary = profile_summary(name);
+            ui.settings = settings;
+            ui.reconnect = running;
+        }
+        if running {
+            self.connect(shell)?;
+        }
+        Ok(())
+    }
+    fn remove_profile(&self, shell: &dyn Shell) -> Result<()> {
+        ensure!(self.stopped(), "请先停止连接，再删除配置。");
+        let name = self.ui.borrow().settings.profile_name.clone();
+        let choice = shell.alert(
+            &format!("删除配置「{name}」？"),
+            "只删除 FlowBar 保存的副本，原来的 YAML 文件不受影响。",
+            &["删除", "取消"],
+        );
+        if choice != 0 {
+            return Ok(());
+        }
+        let mut settings = self.ui.borrow().settings.clone();
+        settings.remove_profile()?;
+        let mut ui = self.ui.borrow_mut();
+        ui.profiles = config::profiles();
+        ui.summary = profile_summary(&settings.profile_name);
+        ui.settings = settings;
         Ok(())
     }
     pub fn connect(&self, shell: &dyn Shell) -> Result<()> {
@@ -446,7 +551,7 @@ impl App {
         let mut groups_changed = false;
         let mut errors = vec![];
         let mut notices = vec![];
-        let (mut offer, mut staged, mut due) = (None, None, false);
+        let (mut offer, mut staged, mut due, mut restart) = (None, None, false, false);
         for event in events {
             let current = self.ui.borrow().run.as_ref().map(|r| r.id.clone());
             let mut error = None;
@@ -468,20 +573,14 @@ impl App {
                         .into();
                     }
                     Event::Stopped(id) if current.as_deref() == Some(&id) => {
-                        ui.log = ui.run.as_ref().map(|r| r.log());
-                        ui.run = None;
-                        ui.groups.clear();
-                        ui.refreshing = false;
-                        ui.operation = false;
+                        ui.end_run();
                         ui.phase = Phase::Stopped;
                         ui.message = "已停止".into();
+                        restart = std::mem::take(&mut ui.reconnect);
                     }
                     Event::Failed(id, message) if current.as_deref() == Some(&id) => {
-                        ui.log = ui.run.as_ref().map(|r| r.log());
-                        ui.run = None;
-                        ui.groups.clear();
-                        ui.refreshing = false;
-                        ui.operation = false;
+                        ui.end_run();
+                        ui.reconnect = false;
                         ui.phase = Phase::Failed;
                         // Keep the tray menu and two-line footer short; recovery steps
                         // and paths belong in a dialog and the saved error log.
@@ -513,6 +612,37 @@ impl App {
                         ui.groups = groups;
                         ui.settings.selections.insert(group, choice);
                         error = ui.settings.save().err();
+                    }
+                    Event::Delays(id, group, delays, groups) if current.as_deref() == Some(&id) => {
+                        ui.testing.remove(&group);
+                        if !groups.is_empty() {
+                            ui.groups = groups;
+                        }
+                        match delays {
+                            // A failed node gets a result too, replacing an older delay.
+                            Ok(delays) => {
+                                let Ui {
+                                    groups,
+                                    delays: shown,
+                                    ..
+                                } = &mut *ui;
+                                for choice in groups
+                                    .iter()
+                                    .filter(|g| g.name == group)
+                                    .flat_map(|g| &g.choices)
+                                {
+                                    shown.insert(choice.clone(), delays.get(choice).copied());
+                                }
+                            }
+                            // A test fails when the connection stops during it.
+                            Err(message) if ui.phase == Phase::Running => {
+                                error = Some(anyhow::anyhow!("测试延迟失败：{message}"))
+                            }
+                            Err(_) => {}
+                        }
+                        // Only the menu shows latencies; it may already be open.
+                        handled = false;
+                        groups_changed = true;
                     }
                     Event::Error(message) => {
                         ui.operation = false;
@@ -575,6 +705,9 @@ impl App {
         if groups_changed {
             shell.groups_changed();
         }
+        if restart {
+            errors.extend(self.connect(shell).err());
+        }
         // Alerts run a modal loop that can re-enter drain; showing them mid-batch would
         // apply this batch's older events after newer ones.
         for error in errors {
@@ -595,56 +728,65 @@ impl App {
         self.advance_smoke(shell);
     }
     fn advance_smoke(&self, shell: &dyn Shell) {
-        let (step, phase_running, phase_stopped, failed, operation, mode, selection, failure) = {
+        const GROUP: &str = "策略 / 测试";
+        let (step, action) = {
             let ui = self.ui.borrow();
-            (
-                ui.smoke_step,
-                ui.phase == Phase::Running,
-                ui.phase == Phase::Stopped,
-                ui.phase == Phase::Failed,
-                ui.operation,
-                ui.settings.mode.clone(),
-                ui.settings.selections.get("策略 / 测试").cloned(),
-                ui.message.clone(),
-            )
-        };
-        let Some(step) = step else {
-            return;
-        };
-        if failed {
-            eprintln!("FAIL Rust UI smoke: {failure}");
-            std::process::exit(1);
-        }
-        let action = match step {
-            0 if phase_running => Some(Action::Mode("global".into())),
-            1 if mode == "global" && !operation => Some(Action::Mode("rule".into())),
-            2 if mode == "rule" && !operation => {
-                Some(Action::Select("策略 / 测试".into(), "REJECT".into()))
-            }
-            3 if selection.as_deref() == Some("REJECT") && !operation => {
-                Some(Action::Select("策略 / 测试".into(), "DIRECT".into()))
-            }
-            4 if selection.as_deref() == Some("DIRECT") && !operation => {
-                shell.close_settings();
-                assert!(!shell.settings_open());
-                shell.show_settings();
-                Some(Action::Connect)
-            }
-            5 if phase_stopped => {
-                println!(
-                    "PASS native Rust UI: settings toggles, mode changes, node selection, window close/reopen, core stop"
-                );
-                shell.quit();
-                None
-            }
-            _ => None,
-        };
-        if let Some(action) = action {
-            self.ui.borrow_mut().smoke_step = Some(step + 1);
-            if let Err(error) = self.act(shell, action) {
-                eprintln!("FAIL Rust UI smoke: {error:#}");
+            let Some(step) = ui.smoke_step else {
+                return;
+            };
+            if ui.phase == Phase::Failed {
+                eprintln!("FAIL Rust UI smoke: {}", ui.message);
                 std::process::exit(1);
             }
+            let idle = !ui.operation;
+            let running = ui.phase == Phase::Running && idle;
+            let selection = ui.settings.selections.get(GROUP).map(String::as_str);
+            // The test home holds two profiles.
+            let other = || {
+                ui.profiles
+                    .iter()
+                    .find(|name| **name != ui.settings.profile_name)
+                    .map(|name| Action::Profile(name.clone()))
+            };
+            let action = match step {
+                0 if running => Some(Action::Mode("global".into())),
+                1 if ui.settings.mode == "global" && idle => Some(Action::Mode("rule".into())),
+                2 if ui.settings.mode == "rule" && idle => {
+                    Some(Action::Select(GROUP.into(), "REJECT".into()))
+                }
+                3 if selection == Some("REJECT") && idle => {
+                    Some(Action::Select(GROUP.into(), "DIRECT".into()))
+                }
+                4 if selection == Some("DIRECT") && idle => Some(Action::Delay(GROUP.into())),
+                // Each choice has a result, a delay or a failure, whether or not it passed.
+                5 if ui.testing.is_empty() && ui.delays.len() == 2 => other(),
+                // The other profile has no node choices of its own yet.
+                6 if running && ui.settings.selections.is_empty() => other(),
+                7 if running && selection == Some("DIRECT") => Some(Action::Connect),
+                8 if ui.phase == Phase::Stopped => Some(Action::Quit),
+                _ => None,
+            };
+            (step, action)
+        };
+        let Some(action) = action else {
+            return;
+        };
+        self.ui.borrow_mut().smoke_step = Some(step + 1);
+        if action == Action::Quit {
+            println!(
+                "PASS native Rust UI: settings toggles, mode changes, node selection, latency test, profile switching, window close/reopen, core stop"
+            );
+            shell.quit();
+            return;
+        }
+        if action == Action::Connect {
+            shell.close_settings();
+            assert!(!shell.settings_open());
+            shell.show_settings();
+        }
+        if let Err(error) = self.act(shell, action) {
+            eprintln!("FAIL Rust UI smoke: {error:#}");
+            std::process::exit(1);
         }
     }
     pub fn save_options(&self, shell: &dyn Shell) -> Result<()> {
@@ -689,10 +831,37 @@ impl App {
     fn import(&self, shell: &dyn Shell) -> Result<()> {
         ensure!(self.stopped(), "请先停止连接，再导入配置。");
         if let Some(path) = shell.choose_profile() {
-            let settings = config::import_profile(&path, None)?;
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            let mut name = config::profile_name(&stem);
+            // Profile names are file names, which may ignore case.
+            let profiles = self.ui.borrow().profiles.clone();
+            let taken = |name: &str| {
+                profiles
+                    .iter()
+                    .any(|p| p.to_lowercase() == name.to_lowercase())
+            };
+            if taken(&name) {
+                let choice = shell.alert(
+                    &format!("已有名为「{name}」的配置"),
+                    "订阅更新后可以替换它；导入另一个同名文件时，可以另存为新配置。",
+                    &["替换", "另存为新配置", "取消"],
+                );
+                match choice {
+                    0 => {}
+                    1 => {
+                        name = (2..)
+                            .map(|number| format!("{name} {number}"))
+                            .find(|name| !taken(name))
+                            .unwrap()
+                    }
+                    _ => return Ok(()),
+                }
+            }
+            let settings = config::import_profile(&path, Some(&name))?;
             let mut ui = self.ui.borrow_mut();
+            ui.profiles = config::profiles();
+            ui.summary = profile_summary(&settings.profile_name);
             ui.settings = settings;
-            ui.summary = profile_summary();
         }
         shell.render();
         Ok(())
@@ -791,12 +960,44 @@ impl App {
     /// disk, so callers that also build a [`View`] pass its value.
     pub fn menu(&self, login: Login) -> Vec<Entry> {
         let ui = self.ui.borrow();
-        let busy = matches!(ui.phase, Phase::Starting | Phase::Stopping);
-        let enabled = !busy && !ui.operation;
+        let enabled = ui.menu_enabled();
         let stopped = matches!(ui.phase, Phase::Stopped | Phase::Failed);
+        let active = ui.profiles.contains(&ui.settings.profile_name);
+        let mut profiles: Vec<_> = ui
+            .profiles
+            .iter()
+            .map(|name| {
+                item(
+                    name,
+                    Some(Action::Profile(name.clone())),
+                    enabled,
+                    Some(*name == ui.settings.profile_name),
+                )
+            })
+            .collect();
+        if !profiles.is_empty() {
+            profiles.push(Entry::Separator);
+        }
+        profiles.push(item("导入 YAML…", Some(Action::Import), stopped, None));
+        if active {
+            profiles.push(item(
+                "删除当前配置…",
+                Some(Action::RemoveProfile),
+                stopped,
+                None,
+            ));
+        }
         let mut entries = vec![
             item(&format!("FlowBar · {}", ui.message), None, false, None),
-            item(&ui.settings.profile_name, None, false, None),
+            Entry::Menu {
+                title: if active {
+                    format!("配置：{}", ui.settings.profile_name)
+                } else {
+                    "配置".into()
+                },
+                entries: profiles,
+                groups: false,
+            },
             Entry::Separator,
             item(
                 if ui.phase == Phase::Running {
@@ -831,7 +1032,7 @@ impl App {
         if !ui.groups.is_empty() {
             entries.push(Entry::Menu {
                 title: "策略组与节点".into(),
-                entries: group_entries(&ui.groups, enabled),
+                entries: group_entries(&ui),
                 groups: true,
             });
         }
@@ -869,7 +1070,6 @@ impl App {
             ),
             Entry::Separator,
             item("设置…", Some(Action::Settings), true, None),
-            item("导入 YAML…", Some(Action::Import), stopped, None),
             item(
                 "打开运行日志",
                 Some(Action::Logs),
@@ -897,13 +1097,20 @@ impl App {
         let imported = ui.summary.is_some();
         let login = sys::login_status();
         let (update_title, update_action) = update_entry(&ui.update);
+        let (profiles, profile_index) = if ui.profiles.is_empty() {
+            (vec!["尚未导入配置".into()], Some(0))
+        } else {
+            let index = ui
+                .profiles
+                .iter()
+                .position(|p| *p == ui.settings.profile_name);
+            (ui.profiles.clone(), index)
+        };
         View {
             imported,
-            profile: if imported {
-                ui.settings.profile_name.clone()
-            } else {
-                "尚未导入配置".into()
-            },
+            switchable: !ui.profiles.is_empty() && ui.menu_enabled(),
+            profiles,
+            profile_index,
             stats: ui
                 .summary
                 .clone()
@@ -948,35 +1155,51 @@ impl App {
     pub fn update_action(&self) -> Option<Action> {
         update_entry(&self.ui.borrow().update).1
     }
+    /// The 策略组与节点 submenu's entries, for a front end that refreshes it while open.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub fn group_entries(&self) -> Vec<Entry> {
+        group_entries(&self.ui.borrow())
+    }
 }
 
-/// Each group as a submenu of its choices; only selector groups accept a choice.
-pub fn group_entries(groups: &[Group], enabled: bool) -> Vec<Entry> {
-    groups
+/// Each group as a submenu: a latency test, then its choices with their latencies once
+/// tested. Only selector groups accept a choice.
+fn group_entries(ui: &Ui) -> Vec<Entry> {
+    let enabled = ui.menu_enabled();
+    ui.groups
         .iter()
-        .map(|group| Entry::Menu {
-            title: group_title(group),
-            entries: group
-                .choices
-                .iter()
-                .map(|choice| {
-                    item(
-                        choice,
-                        Some(Action::Select(group.name.clone(), choice.clone())),
-                        enabled && selectable(group),
-                        Some(&group.current == choice),
-                    )
-                })
-                .collect(),
-            groups: false,
+        .map(|group| {
+            let testing = ui.testing.contains(&group.name);
+            let mut entries = vec![
+                item(
+                    if testing {
+                        "正在测试延迟…"
+                    } else {
+                        "测试延迟"
+                    },
+                    Some(Action::Delay(group.name.clone())),
+                    enabled && !testing,
+                    None,
+                ),
+                Entry::Separator,
+            ];
+            entries.extend(group.choices.iter().map(|choice| Entry::Item {
+                title: choice.clone(),
+                detail: ui.delays.get(choice).map(|delay| delay_text(*delay)),
+                action: Some(Action::Select(group.name.clone(), choice.clone())),
+                enabled: enabled && group.kind.eq_ignore_ascii_case("selector"),
+                checked: Some(&group.current == choice),
+            }));
+            Entry::Menu {
+                title: format!("{} → {}", group.name, group.current),
+                entries,
+                groups: false,
+            }
         })
         .collect()
 }
-pub fn group_title(group: &Group) -> String {
-    format!("{} → {}", group.name, group.current)
-}
-pub fn selectable(group: &Group) -> bool {
-    group.kind.eq_ignore_ascii_case("selector")
+fn delay_text(delay: Option<u16>) -> String {
+    delay.map_or_else(|| "超时".into(), |ms| format!("{ms} ms"))
 }
 /// Menu and settings window text for the update state, and the action it offers.
 fn update_entry(update: &Update) -> (String, Option<Action>) {
@@ -992,8 +1215,8 @@ fn update_entry(update: &Update) -> (String, Option<Action>) {
     }
 }
 /// Counts shown in the settings window. Parsing a large profile is costly, so callers cache it.
-fn profile_summary() -> Option<String> {
-    let yaml = fs::read_to_string(config::home().join("profile.yaml")).ok()?;
+fn profile_summary(name: &str) -> Option<String> {
+    let yaml = fs::read_to_string(config::profile_path(name)).ok()?;
     let summary = config::summary(&yaml).ok()?;
     Some(format!(
         "{} 个节点 · {} 个策略组 · {} 条规则",

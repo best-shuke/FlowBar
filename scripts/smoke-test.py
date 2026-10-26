@@ -86,7 +86,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 with tempfile.TemporaryDirectory(prefix='flowbar-smoke-') as temp:
     temp = Path(temp)
     os.chmod(temp, 0o700)
-    original = HOME / 'profile.yaml'
+    # The active imported profile; FlowBar 0.5 and earlier kept a single profile.yaml.
+    try:
+        name = json.loads((HOME / 'settings.json').read_text(encoding='utf-8'))['profileName']
+        original = HOME / 'Profiles' / f'{name}.yaml'
+    except (OSError, ValueError, KeyError):
+        original = HOME / 'profile.yaml'
+    if not original.exists():
+        original = HOME / 'profile.yaml'
     if original.exists():
         for tun in [False, True]:
             config = temp / ('tun-validation.yaml' if tun else 'runtime.yaml')
