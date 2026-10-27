@@ -2,7 +2,7 @@
 # Downloads a pinned rill release archive, checks its SHA-256 and unpacks into a directory the
 # core, rill (rill.exe), with the notices of what it links: LICENSE-RILL-THIRD-PARTY.txt and,
 # for Windows, LICENSE-WINTUN.txt. rill's own LICENSE and NOTICE are in Resources/.
-# Usage: fetch-rill.sh <version, e.g. v0.1.2> <target, e.g. aarch64-apple-darwin> <sha256> <directory>
+# Usage: fetch-rill.sh <version, e.g. v0.1.4> <target, e.g. aarch64-apple-darwin> <sha256> <directory>
 set -euo pipefail
 version=$1 target=$2 expected=$3 output=$4
 repository=best-shuke/rill

@@ -13,7 +13,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # The bundled core: a rill release (https://github.com/best-shuke/rill/releases).
-  RILL_VERSION: v0.1.2
+  RILL_VERSION: v0.1.4
 
 jobs:
   test:
@@ -25,15 +25,15 @@ jobs:
           - os: macos-15
             system: macos
             target_core: aarch64-apple-darwin
-            sha256: efe63338d1d5c1425dd8a55723ad2840582824e797619ae018b431365051f221
+            sha256: 840683df45bb135d51eb5e34589e57e399c16a78cd360fd62413d86cdfc97abf
           - os: ubuntu-22.04
             system: linux
             target_core: x86_64-unknown-linux-musl
-            sha256: 5531c6efb473cdc97eeffa54aed83611608c45bdffbf660a9d3e953f9c9dbc0e
+            sha256: 3e80869d9cf04df17529a954d811442e09cf322501d673e6e1c772b68cf5028e
           - os: windows-2022
             system: windows
             target_core: x86_64-pc-windows-msvc
-            sha256: fca3e02f47c28bbf2aa5fd8864f7871509bc4930bada985ded36a20967508512
+            sha256: 529c5c9c0ac1b4b91286b663953ce9febc74631754ae176b16ca589af8130e1a
     runs-on: ${{ matrix.os }}
     defaults:
       run:
