@@ -197,8 +197,16 @@ pub fn terminate(pid: u32) {
         unsafe { TerminateProcess(raw(&process), 1) };
     }
 }
+/// Ends a process right away.
+pub fn kill(pid: u32) {
+    #[cfg(unix)]
+    if (1..=i32::MAX as u32).contains(&pid) {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    terminate(pid);
+}
 /// Waits up to `timeout` for a process that is not our child to exit.
-#[cfg(any(not(target_os = "macos"), test))]
 pub fn wait_exit(pid: u32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while alive(pid) {

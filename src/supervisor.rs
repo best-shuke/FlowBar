@@ -46,6 +46,9 @@ const ROOT_HOME: &str = "/root";
 pub struct Status {
     pub state: String,
     pub core_pid: Option<u32>,
+    /// The FlowBar that started the session. FlowBar 0.7.0 and earlier did not record it.
+    #[serde(default)]
+    pub parent: Option<u32>,
 }
 #[cfg(unix)]
 pub fn root_session(uid: u32, id: &str) -> PathBuf {
@@ -61,12 +64,13 @@ pub fn tun_session(_stage: &Path, id: &str) -> PathBuf {
 pub fn tun_session(stage: &Path, _id: &str) -> PathBuf {
     stage.to_path_buf()
 }
-pub fn status(path: &Path, state: &str, pid: Option<u32>) -> Result<()> {
+pub fn status(path: &Path, state: &str, pid: Option<u32>, parent: u32) -> Result<()> {
     config::atomic_write(
         &path.join("status.json"),
         &serde_json::to_vec(&Status {
             state: state.into(),
             core_pid: pid,
+            parent: Some(parent),
         })?,
         0o644,
     )
@@ -78,30 +82,48 @@ pub fn read_status(path: &Path) -> Option<Status> {
 pub fn running(path: &Path) -> bool {
     read_status(path).is_some_and(|s| s.state == "running" && s.core_pid.is_some_and(is_core))
 }
-/// After a crash or reboot the recorded PID can belong to any process, so it must still be a core.
+/// The program a process runs.
 #[cfg(target_os = "macos")]
-fn is_core(pid: u32) -> bool {
+fn executable(pid: u32) -> io::Result<PathBuf> {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
     let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let length =
         unsafe { libc::proc_pidpath(pid as i32, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
     if length <= 0 {
-        // Keep the session if the process exists but its path is hidden from us.
-        return io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        return Err(io::Error::last_os_error());
     }
-    Path::new(OsStr::from_bytes(&buffer[..length as usize]))
-        .file_name()
-        .is_some_and(|name| name == CORE || name == LEGACY_CORE)
+    Ok(PathBuf::from(OsStr::from_bytes(&buffer[..length as usize])))
 }
 #[cfg(target_os = "linux")]
+fn executable(pid: u32) -> io::Result<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/exe"))
+}
+/// After a crash or reboot the recorded PID can belong to any process, so it must still be a core.
+#[cfg(unix)]
 fn is_core(pid: u32) -> bool {
-    match fs::read_link(format!("/proc/{pid}/exe")) {
-        Ok(path) => path
-            .file_name()
-            .is_some_and(|name| name == CORE || name == LEGACY_CORE),
+    match executable(pid) {
+        Ok(path) => path.file_name().is_some_and(|name| {
+            // Linux marks a program removed since it started, such as the previous version's
+            // core after an update.
+            let name = name.to_string_lossy();
+            let name = name.strip_suffix(" (deleted)").unwrap_or(&name);
+            name == CORE || name == LEGACY_CORE
+        }),
         // Keep the session if the process exists but its path is hidden from us.
         Err(error) => error.kind() == io::ErrorKind::PermissionDenied,
     }
+}
+/// Whether a process runs the core copy in a root session directory, which only root writes.
+/// A PID that a reboot gave to another program, even another rill, never matches.
+#[cfg(unix)]
+fn runs_session_core(pid: u32, session: &Path) -> bool {
+    let Ok(running) = executable(pid).and_then(fs::metadata) else {
+        return false;
+    };
+    [CORE, LEGACY_CORE].into_iter().any(|name| {
+        fs::symlink_metadata(session.join(name))
+            .is_ok_and(|copy| (copy.dev(), copy.ino()) == (running.dev(), running.ino()))
+    })
 }
 #[cfg(windows)]
 fn is_core(pid: u32) -> bool {
@@ -262,11 +284,12 @@ fn wait_ready(mut child: process::ManagedChild, session: &Path) -> Result<()> {
 pub fn root_main(parent: u32, uid: u32, id: &str) -> Result<()> {
     let (user_data, session, cache) = root_paths(uid, id)?;
     let sessions = session.parent().unwrap();
+    let mut log = root_log(&session, "core.log", uid)?;
+    stop_leftovers(sessions, id, parent, &mut log, runs_session_core);
     config::prune_sessions(sessions, |other| {
         other == id || running(&sessions.join(other))
     });
     let stage = user_data.join("Sessions").join(id);
-    let mut log = root_log(&session, "core.log", uid)?;
     let core = session.join(CORE);
     let root_config = session.join("config.yaml");
     struct Cleanup(PathBuf, PathBuf);
@@ -302,7 +325,7 @@ pub fn root_main(parent: u32, uid: u32, id: &str) -> Result<()> {
     })();
     if let Err(ref error) = result {
         let _ = writeln!(log, "{error:#}");
-        let _ = status(&session, "failed", None);
+        let _ = status(&session, "failed", None, parent);
     }
     result
 }
@@ -370,6 +393,13 @@ fn stage_main(parent: u32, stage: &Path, data: &Path, elevated: bool) -> Result<
     #[cfg(unix)]
     options.mode(0o600);
     let mut log = options.open(stage.join("core.log"))?;
+    let id = stage
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    stop_leftovers(stage.parent().unwrap(), id, parent, &mut log, |pid, _| {
+        is_core(pid)
+    });
     let config = stage.join("config.yaml");
     let result = (|| {
         let yaml = fs::read_to_string(&config)?;
@@ -391,9 +421,53 @@ fn stage_main(parent: u32, stage: &Path, data: &Path, elevated: bool) -> Result<
     })();
     if let Err(ref error) = result {
         let _ = writeln!(log, "{error:#}");
-        let _ = status(stage, "failed", None);
+        let _ = status(stage, "failed", None, parent);
     }
     result
+}
+
+/// A core that an earlier session left running holds the ports and the data directory, so the
+/// new one fails with "Address already in use". After an update or a quick restart its
+/// supervisor may still be stopping it, and a killed supervisor leaves its core behind.
+/// FlowBar runs one session at a time, so a core is left over when its FlowBar is this one, has
+/// exited, or is a version that did not record itself. The session of another FlowBar that is
+/// still running, such as the app during the engine smoke test, is kept.
+fn stop_leftovers(
+    sessions: &Path,
+    id: &str,
+    parent: u32,
+    log: &mut fs::File,
+    is_session_core: impl Fn(u32, &Path) -> bool,
+) {
+    let cores: Vec<u32> = fs::read_dir(sessions)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name() != id)
+        .filter_map(|entry| {
+            let session = entry.path();
+            let status = read_status(&session).filter(|s| s.state == "running")?;
+            let pid = status.core_pid?;
+            let left = status
+                .parent
+                .is_none_or(|owner| owner == parent || !process::alive(owner));
+            (left && is_session_core(pid, &session)).then_some(pid)
+        })
+        .collect();
+    for &pid in &cores {
+        let _ = writeln!(log, "正在停止上次会话遗留的内核（PID {pid}）…");
+        process::terminate(pid);
+    }
+    // The time a supervisor gives its own core to stop.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for &pid in &cores {
+        if !process::wait_exit(pid, deadline.saturating_duration_since(Instant::now())) {
+            process::kill(pid);
+            if !process::wait_exit(pid, Duration::from_secs(2)) {
+                let _ = writeln!(log, "无法停止遗留的内核（PID {pid}）。");
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -471,14 +545,14 @@ fn run_core(
                     config::dns_port(yaml)?,
                 )?);
             }
-            status(session, "running", Some(pid))
+            status(session, "running", Some(pid), parent)
         },
     )?;
     #[cfg(target_os = "macos")]
     drop(dns);
     #[cfg(not(target_os = "macos"))]
     let _ = tun;
-    status(session, "stopped", None)?;
+    status(session, "stopped", None, parent)?;
     Ok(())
 }
 
@@ -662,5 +736,108 @@ mod macos_dns {
                 CFRelease(self.store);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn sleeper(program: &Path) -> process::ManagedChild {
+        let mut command = Command::new(program);
+        #[cfg(unix)]
+        command.arg("30");
+        #[cfg(windows)]
+        command.args(["-n", "30", "127.0.0.1"]);
+        process::ManagedChild::new(command.stdout(Stdio::null()).spawn().unwrap())
+    }
+    #[cfg(unix)]
+    const SLEEP: &str = "/bin/sleep";
+    #[cfg(windows)]
+    const SLEEP: &str = "ping";
+    /// A process that another thread reaps, as a supervisor reaps its core.
+    fn reaped() -> u32 {
+        let mut child = sleeper(Path::new(SLEEP));
+        let pid = child.0.id();
+        thread::spawn(move || {
+            let _ = child.0.wait();
+        });
+        pid
+    }
+
+    #[test]
+    fn stops_cores_left_by_this_or_an_exited_flowbar() {
+        let sessions = tempfile::tempdir().unwrap();
+        let ours = std::process::id();
+        let other = sleeper(Path::new(SLEEP));
+        let exited = {
+            let mut child = sleeper(Path::new(SLEEP));
+            child.stop();
+            child.0.id()
+        };
+        let session = |name: &str, state: &str, parent: Option<u32>| {
+            let path = sessions.path().join(name);
+            fs::create_dir(&path).unwrap();
+            let pid = reaped();
+            let status = Status {
+                state: state.into(),
+                core_pid: Some(pid),
+                parent,
+            };
+            fs::write(
+                path.join("status.json"),
+                serde_json::to_vec(&status).unwrap(),
+            )
+            .unwrap();
+            pid
+        };
+        let left = [
+            // Written by FlowBar 0.7.0 or earlier.
+            session("legacy", "running", None),
+            session("same", "running", Some(ours)),
+            session("exited", "running", Some(exited)),
+        ];
+        let kept = [
+            session("current", "running", Some(ours)),
+            session("other", "running", Some(other.0.id())),
+            session("stopped", "stopped", None),
+        ];
+        let logs = tempfile::tempdir().unwrap();
+        let mut log = fs::File::create(logs.path().join("core.log")).unwrap();
+        stop_leftovers(sessions.path(), "current", ours, &mut log, |_, _| true);
+        assert!(left.iter().all(|&pid| !process::alive(pid)));
+        assert!(kept.iter().all(|&pid| process::alive(pid)));
+        let text = fs::read_to_string(logs.path().join("core.log")).unwrap();
+        assert!(left.iter().all(|pid| text.contains(&format!("PID {pid}"))));
+        for pid in kept {
+            process::kill(pid);
+            assert!(process::wait_exit(pid, Duration::from_secs(5)));
+        }
+        // An unrelated process is never stopped.
+        let session = sessions.path().join("legacy");
+        let pid = reaped();
+        status(&session, "running", Some(pid), exited).unwrap();
+        stop_leftovers(sessions.path(), "current", ours, &mut log, |_, _| false);
+        assert!(process::alive(pid));
+        process::kill(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recognises_a_session_core_even_after_its_program_is_removed() {
+        let session = tempfile::tempdir().unwrap();
+        let copy = session.path().join(CORE);
+        fs::copy(SLEEP, &copy).unwrap();
+        let mut core = sleeper(&copy);
+        let pid = core.0.id();
+        assert!(is_core(pid) && runs_session_core(pid, session.path()));
+        assert!(!runs_session_core(pid, tempfile::tempdir().unwrap().path()));
+        let mut other = sleeper(Path::new(SLEEP));
+        assert!(!is_core(other.0.id()) && !runs_session_core(other.0.id(), session.path()));
+        other.stop();
+        fs::remove_file(&copy).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(is_core(pid));
+        assert!(!runs_session_core(pid, session.path()));
+        core.stop();
     }
 }
