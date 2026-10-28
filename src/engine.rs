@@ -266,7 +266,15 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
     ));
     let mut helper = None;
     if run.settings.tun {
-        emit(Event::Progress(run.id.clone(), "等待管理员授权…".into()));
+        emit(Event::Progress(
+            run.id.clone(),
+            if cfg!(target_os = "macos") {
+                "正在连接 TUN 后台服务…"
+            } else {
+                "等待管理员授权…"
+            }
+            .into(),
+        ));
         #[cfg(target_os = "macos")]
         crate::privileged::launch(run)?;
         #[cfg(not(target_os = "macos"))]

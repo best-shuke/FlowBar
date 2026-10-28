@@ -238,6 +238,11 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         #[cfg(unix)]
         options.mode(mode);
         let mut file = options.open(&temporary)?;
+        // launchd starts the privileged helper with umask 077. Status files still
+        // need the explicitly requested 0644 so the unprivileged UI can read them.
+        // Set permissions on the open descriptor, before publishing the file.
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;

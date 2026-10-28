@@ -28,6 +28,14 @@ try:
         response = json.loads(client.recv(65536))
         assert response['error'], 'Helper must reject a Python client with the same UID'
     print('PASS same-user unsigned/unrelated client rejected; helper reused across application launches')
+except Exception:
+    # These are DIRECT-only CI fixtures; include concrete state and core output on failure.
+    for session in sorted((base / 'Sessions').glob('*')):
+        for name in ['status.json', 'bootstrap.log', 'core.log']:
+            path = session / name
+            if path.exists():
+                print(f'{path}:\n{path.read_text(errors="replace")[-32768:]}', flush=True)
+    raise
 finally:
     subprocess.run(['sudo', 'launchctl', 'bootout', f'system/{label}'], check=False, capture_output=True)
     subprocess.run(['sudo', 'rm', '-f', str(plist), str(base / 'helper.sock')], check=True)
