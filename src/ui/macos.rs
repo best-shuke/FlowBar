@@ -287,7 +287,10 @@ impl Shell for Delegate {
                 unsafe {
                     button.performClick(None);
                 }
-                assert!(!button.isEnabled());
+                // performClick runs a short nested event loop for the button animation.
+                // On a fast runner the request can finish before it returns.
+                let ui = delegate.ivars().app.ui.borrow();
+                assert!(!ui.testing.is_empty() || ui.delays.len() == 2);
             } else if delegate.ivars().app.ui.borrow().testing.is_empty() {
                 assert_eq!(delegate.ivars().app.ui.borrow().delays.len(), 2);
                 assert!(button.isEnabled());

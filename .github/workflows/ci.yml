@@ -60,6 +60,7 @@ jobs:
         run: cargo test --locked -- --test-threads=1
 
       - name: Package
+        id: package
         run: |
           ./scripts/fetch-rill.sh "$RILL_VERSION" ${{ matrix.target_core }} ${{ matrix.sha256 }} "$(dirname "$CORE")"
           ./scripts/fetch-geo.sh "$RUNNER_TEMP/geo"
@@ -102,5 +103,5 @@ jobs:
           pwsh -File scripts/installer-smoke-test.ps1 dist/FlowBar-0.0.0-windows-x86_64-setup.exe
 
       - name: Persistent macOS helper smoke test
-        if: matrix.system == 'macos'
+        if: ${{ !cancelled() && matrix.system == 'macos' && steps.package.outcome == 'success' }}
         run: python3 scripts/helper-smoke-test.py
