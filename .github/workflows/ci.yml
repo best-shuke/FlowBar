@@ -100,3 +100,7 @@ jobs:
           PATH="$PATH:/c/Program Files (x86)/NSIS"
           makensis -DVERSION=0.0.0 -DARCH=x86_64 scripts/installer.nsi
           pwsh -File scripts/installer-smoke-test.ps1 dist/FlowBar-0.0.0-windows-x86_64-setup.exe
+
+      - name: Persistent macOS helper smoke test
+        if: matrix.system == 'macos'
+        run: python3 scripts/helper-smoke-test.py

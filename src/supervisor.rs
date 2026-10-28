@@ -84,7 +84,7 @@ pub fn running(path: &Path) -> bool {
 }
 /// The program a process runs.
 #[cfg(target_os = "macos")]
-fn executable(pid: u32) -> io::Result<PathBuf> {
+pub(crate) fn executable(pid: u32) -> io::Result<PathBuf> {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
     let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let length =
@@ -95,7 +95,7 @@ fn executable(pid: u32) -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsStr::from_bytes(&buffer[..length as usize])))
 }
 #[cfg(target_os = "linux")]
-fn executable(pid: u32) -> io::Result<PathBuf> {
+pub(crate) fn executable(pid: u32) -> io::Result<PathBuf> {
     fs::read_link(format!("/proc/{pid}/exe"))
 }
 /// After a crash or reboot the recorded PID can belong to any process, so it must still be a core.
@@ -210,6 +210,7 @@ fn root_paths(uid: u32, id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
 fn root_log(session: &Path, name: &str, uid: u32) -> Result<fs::File> {
     let log = fs::OpenOptions::new()
         .create_new(true)
+        .read(true)
         .write(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
@@ -267,7 +268,7 @@ fn wait_ready(mut child: process::ManagedChild, session: &Path) -> Result<()> {
         {
             let detail = ["core.log", "bootstrap.log"]
                 .into_iter()
-                .filter_map(|name| fs::read_to_string(session.join(name)).ok())
+                .filter_map(|name| crate::logging::tail(&session.join(name), 32768).ok())
                 .collect::<Vec<_>>()
                 .join("\n");
             anyhow::bail!("管理员内核启动失败：{}", detail.trim());
@@ -389,7 +390,7 @@ pub fn user_main(parent: u32, id: &str) -> Result<()> {
 /// Runs the core from a session stage, which then serves as the session directory too.
 fn stage_main(parent: u32, stage: &Path, data: &Path, elevated: bool) -> Result<()> {
     let mut options = fs::OpenOptions::new();
-    options.create_new(true).write(true);
+    options.create_new(true).read(true).write(true);
     #[cfg(unix)]
     options.mode(0o600);
     let mut log = options.open(stage.join("core.log"))?;
@@ -557,7 +558,7 @@ fn run_core(
 }
 
 #[cfg(unix)]
-fn root_directory(path: &Path, mode: u32) -> Result<()> {
+pub(crate) fn root_directory(path: &Path, mode: u32) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => ensure!(
             metadata.uid() == 0 && metadata.is_dir(),

@@ -6,6 +6,7 @@ use crate::{
     update,
 };
 use anyhow::{Result, ensure};
+use core_foundation::{base::TCFType, runloop::*};
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
@@ -20,6 +21,7 @@ use objc2_foundation::{
 };
 use objc2_quartz_core::kCACornerCurveContinuous;
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
+use std::sync::Arc;
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
@@ -59,6 +61,14 @@ struct Mac {
     /// The 策略组与节点 submenu and the groups it was built from.
     groups_menu: Option<(Retained<NSMenu>, Vec<Group>)>,
     window: Option<Window>,
+    menu_probe: Option<MenuProbe>,
+}
+struct MenuProbe {
+    menu: Retained<NSMenu>,
+    button: Retained<DelayButton>,
+    clicked: bool,
+    passed: bool,
+    deadline: std::time::Instant,
 }
 struct Ivars {
     app: App,
@@ -105,6 +115,10 @@ define_class!(
                 .and_then(|s| serde_json::from_str::<Action>(&s.to_string()).ok());
             if let Some(action) = action { self.perform(action); }
         }
+        #[unsafe(method(delayClicked:))]
+        fn delay_clicked(&self, sender: &DelayButton) {
+            self.perform(Action::Delay(sender.ivars().clone()));
+        }
         #[unsafe(method(toggleConnection:))]
         fn connection_button(&self, _sender: &AnyObject) { self.perform(Action::Connect); }
         #[unsafe(method(importYaml:))]
@@ -131,6 +145,15 @@ define_class!(
         #[unsafe(method(showSettingsNotification:))]
         fn settings_notification(&self, _notification: &NSNotification) { self.show_settings(); }
     }
+);
+
+// A view-backed command receives the click without NSMenu dismissing its menu tree.
+define_class!(
+    #[unsafe(super(NSButton, NSControl, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = String]
+    struct DelayButton;
+    unsafe impl NSObjectProtocol for DelayButton {}
 );
 
 struct Fill {
@@ -209,6 +232,111 @@ impl Surface {
 }
 
 impl Shell for Delegate {
+    fn smoke_delay(&self, group: &str) -> bool {
+        let mtm = self.mtm();
+        let groups_menu = NSMenu::new(mtm);
+        groups_menu.setAutoenablesItems(false);
+        self.add_entries(&groups_menu, self.ivars().app.group_entries(), &mut None);
+        let groups = self.ivars().app.ui.borrow().groups.clone();
+        let index = groups.iter().position(|g| g.name == group).unwrap();
+        let menu = groups_menu
+            .itemAtIndex(index as isize)
+            .unwrap()
+            .submenu()
+            .unwrap();
+        let button = menu
+            .itemAtIndex(0)
+            .unwrap()
+            .view()
+            .unwrap()
+            .downcast::<DelayButton>()
+            .unwrap();
+        self.ivars().mac.borrow_mut().groups_menu = Some((groups_menu, groups));
+        self.ivars().app.ui.borrow_mut().smoke_step = None;
+        self.ivars().mac.borrow_mut().menu_probe = Some(MenuProbe {
+            menu: menu.clone(),
+            button,
+            clicked: false,
+            passed: false,
+            deadline: std::time::Instant::now() + Duration::from_secs(15),
+        });
+        extern "C" fn tick(_: CFRunLoopTimerRef, _: *mut std::ffi::c_void) {
+            let delegate = unsafe { &*DELEGATE.load(Ordering::SeqCst) };
+            let (button, clicked, deadline) = {
+                let mac = delegate.ivars().mac.borrow();
+                let probe = mac.menu_probe.as_ref().unwrap();
+                (probe.button.clone(), probe.clicked, probe.deadline)
+            };
+            assert!(
+                std::time::Instant::now() < deadline,
+                "latency menu smoke timed out"
+            );
+            assert!(
+                button.window().is_some_and(|w| w.isVisible()),
+                "latency click dismissed its menu"
+            );
+            if !clicked {
+                delegate
+                    .ivars()
+                    .mac
+                    .borrow_mut()
+                    .menu_probe
+                    .as_mut()
+                    .unwrap()
+                    .clicked = true;
+                unsafe {
+                    button.performClick(None);
+                }
+                assert!(!button.isEnabled());
+            } else if delegate.ivars().app.ui.borrow().testing.is_empty() {
+                assert_eq!(delegate.ivars().app.ui.borrow().delays.len(), 2);
+                assert!(button.isEnabled());
+                let menu = {
+                    let mut mac = delegate.ivars().mac.borrow_mut();
+                    let probe = mac.menu_probe.as_mut().unwrap();
+                    probe.passed = true;
+                    probe.menu.clone()
+                };
+                // Result titles have been refreshed while the real menu is tracking.
+                assert!(menu.itemAtIndex(2).unwrap().attributedTitle().is_some());
+                menu.cancelTracking();
+            }
+        }
+        let timer = CFRunLoopTimer::new(
+            unsafe { core_foundation::date::CFAbsoluteTimeGetCurrent() } + 0.1,
+            0.05,
+            0,
+            0,
+            tick,
+            std::ptr::null_mut(),
+        );
+        unsafe {
+            CFRunLoopAddTimer(
+                CFRunLoopGetMain(),
+                timer.as_concrete_TypeRef(),
+                kCFRunLoopCommonModes,
+            );
+        }
+        menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(400.0, 400.0), None);
+        unsafe {
+            CFRunLoopTimerInvalidate(timer.as_concrete_TypeRef());
+        }
+        assert!(
+            self.ivars()
+                .mac
+                .borrow_mut()
+                .menu_probe
+                .take()
+                .unwrap()
+                .passed
+        );
+        println!(
+            "PASS native macOS latency button keeps its menu visible through asynchronous results"
+        );
+        self.ivars().app.ui.borrow_mut().smoke_step = Some(5);
+        self.ivars().app.advance_smoke(self);
+        true
+    }
     fn render(&self) {
         let view = self.ivars().app.view();
         let mac = self.ivars().mac.borrow();
@@ -512,6 +640,10 @@ impl Delegate {
                     enabled,
                     checked,
                 } => {
+                    let delay_group = match &action {
+                        Some(Action::Delay(group)) => Some(group.clone()),
+                        _ => None,
+                    };
                     let quit = matches!(action, Some(Action::Quit));
                     let item = self.item(&title, action, enabled, checked.unwrap_or(false));
                     if detail.is_some() {
@@ -519,6 +651,23 @@ impl Delegate {
                     }
                     if quit {
                         item.setKeyEquivalent(&NSString::from_str("q"));
+                    }
+                    if let Some(group) = delay_group {
+                        let button = DelayButton::alloc(mtm).set_ivars(group);
+                        let button: Retained<DelayButton> = unsafe {
+                            msg_send![super(button), initWithFrame: rect(0.0, 0.0, tab.max(190.0), 24.0)]
+                        };
+                        button.setTitle(&NSString::from_str(&format!("   {title}")));
+                        button.setFont(Some(&NSFont::menuFontOfSize(0.0)));
+                        button.setAlignment(NSTextAlignment::Left);
+                        button.setBordered(false);
+                        button.setEnabled(enabled);
+                        button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                        unsafe {
+                            button.setTarget(Some(self));
+                            button.setAction(Some(sel!(delayClicked:)));
+                        }
+                        item.setView(Some(&button));
                     }
                     menu.addItem(&item);
                 }
@@ -882,6 +1031,13 @@ fn update_items(menu: &NSMenu, entries: &[Entry]) {
             continue;
         };
         set_title(&item, title, detail.as_deref(), tab);
+        if let Some(view) = item
+            .view()
+            .and_then(|view| view.downcast::<DelayButton>().ok())
+        {
+            view.setTitle(&NSString::from_str(&format!("   {title}")));
+            view.setEnabled(*enabled);
+        }
         item.setEnabled(*enabled);
         item.setState(i64::from(checked.unwrap_or(false)) as _);
     }
@@ -1022,6 +1178,50 @@ pub fn login_roundtrip() -> Result<()> {
     Ok(())
 }
 
+struct MenuWake(CFRunLoopSource);
+// CFRunLoopSourceSignal and CFRunLoopWakeUp are thread-safe Core Foundation APIs.
+unsafe impl Send for MenuWake {}
+unsafe impl Sync for MenuWake {}
+impl MenuWake {
+    fn new() -> Result<Self> {
+        extern "C" fn perform(_: *const std::ffi::c_void) {
+            let pointer = DELEGATE.load(Ordering::SeqCst);
+            if !pointer.is_null() {
+                unsafe { &*pointer }.drain();
+            }
+        }
+        let mut context = CFRunLoopSourceContext {
+            version: 0,
+            info: std::ptr::null_mut(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform,
+        };
+        let source = unsafe { CFRunLoopSourceCreate(std::ptr::null(), 0, &mut context) };
+        ensure!(!source.is_null(), "无法创建界面事件源");
+        let source = unsafe { CFRunLoopSource::wrap_under_create_rule(source) };
+        unsafe {
+            CFRunLoopAddSource(
+                CFRunLoopGetMain(),
+                source.as_concrete_TypeRef(),
+                kCFRunLoopCommonModes,
+            );
+        }
+        Ok(Self(source))
+    }
+    fn signal(&self) {
+        unsafe {
+            CFRunLoopSourceSignal(self.0.as_concrete_TypeRef());
+            CFRunLoopWakeUp(CFRunLoopGetMain());
+        }
+    }
+}
+
 pub fn run() -> Result<()> {
     objc2::rc::autoreleasepool(|_| {
         let mtm = MainThreadMarker::new().expect("AppKit must run on the main thread");
@@ -1043,14 +1243,11 @@ pub fn run() -> Result<()> {
             }
             return Ok(());
         }
-        let app = App::new(|| {
-            DispatchQueue::main().exec_async(|| {
-                let pointer = DELEGATE.load(Ordering::SeqCst);
-                // Only dereferenced on the main queue; the delegate is retained for the entire AppKit run loop.
-                if !pointer.is_null() {
-                    unsafe { &*pointer }.drain();
-                }
-            });
+        // Common modes include menu tracking, so results arrive while the menu stays open.
+        let source = Arc::new(MenuWake::new()?);
+        let app = App::new({
+            let source = source.clone();
+            move || source.signal()
         });
         let this = Delegate::alloc(mtm).set_ivars(Ivars {
             app,
@@ -1062,6 +1259,9 @@ pub fn run() -> Result<()> {
         application.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         application.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         application.run();
+        unsafe {
+            CFRunLoopSourceInvalidate(source.0.as_concrete_TypeRef());
+        }
         DELEGATE.store(std::ptr::null_mut(), Ordering::SeqCst);
         Ok(())
     })

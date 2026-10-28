@@ -183,6 +183,10 @@ pub trait Shell {
     /// The groups or their latencies changed while the status menu may be open; the status
     /// item's menu shows them, but the settings window does not.
     fn groups_changed(&self) {}
+    /// Exercise the native latency control in the isolated UI smoke test.
+    fn smoke_delay(&self, _group: &str) -> bool {
+        false
+    }
     /// Sends [`update::Event::Due`] after ten seconds and then hourly.
     fn schedule_updates(&self);
     fn snapshot(&self, _path: &Path) {}
@@ -346,6 +350,9 @@ impl App {
 
     /// Runs an action and shows its error, if any.
     pub fn perform(&self, shell: &dyn Shell, action: Action) {
+        if let Some(run) = &self.ui.borrow().run {
+            run.diagnostic(format!("UI action: {action:?}"));
+        }
         if let Err(error) = self.act(shell, action) {
             self.error(shell, &error.to_string());
             shell.render();
@@ -448,9 +455,16 @@ impl App {
                     }
                 };
                 if let Some(run) = run {
+                    shell.groups_changed();
                     let emit = self.emit.clone();
                     thread::spawn(move || {
+                        let started = std::time::Instant::now();
+                        run.diagnostic(format!("latency test started: group={group:?}"));
                         let delays = run.api.group_delay(&group).map_err(|e| e.to_string());
+                        run.diagnostic(format!(
+                            "latency test finished in {} ms: group={group:?} result={delays:?}",
+                            started.elapsed().as_millis()
+                        ));
                         let groups = run.api.groups(&run.group_order()).unwrap_or_default();
                         emit(Event::Delays(run.id.clone(), group, delays, groups));
                     });
@@ -784,6 +798,11 @@ impl App {
             assert!(!shell.settings_open());
             shell.show_settings();
         }
+        if let Action::Delay(group) = &action {
+            if shell.smoke_delay(group) {
+                return;
+            }
+        }
         if let Err(error) = self.act(shell, action) {
             eprintln!("FAIL Rust UI smoke: {error:#}");
             std::process::exit(1);
@@ -953,6 +972,9 @@ impl App {
         }
     }
     pub fn error(&self, shell: &dyn Shell, message: &str) {
+        if let Some(run) = &self.ui.borrow().run {
+            run.diagnostic(format!("UI error: {message}"));
+        }
         shell.alert("FlowBar", message, &[]);
     }
 
@@ -1118,7 +1140,11 @@ impl App {
             editable: stopped,
             tun: ui.settings.tun,
             tun_hint: if ui.settings.tun {
-                "接管所有应用的流量；连接时需要管理员授权。"
+                if cfg!(target_os = "macos") {
+                    "接管所有应用的流量；首次安装或升级后台服务时授权，之后连接无需重复输入密码。"
+                } else {
+                    "接管所有应用的流量；连接时需要管理员授权。"
+                }
             } else {
                 "只开放下方的本地 HTTP/SOCKS 端口，不修改系统代理，需在应用中手动指定。"
             },

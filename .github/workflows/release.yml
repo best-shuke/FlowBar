@@ -145,11 +145,21 @@ jobs:
         run: |
           cp scripts/install.sh scripts/install.ps1 assets/
           DOWNLOAD="https://github.com/$GITHUB_REPOSITORY/releases/latest/download"
+          NOTES_FILE="$RUNNER_TEMP/flowbar-release-notes.md"
+          if [ -f "docs/releases/${GITHUB_REF_NAME#v}.md" ]; then
+            cat "docs/releases/${GITHUB_REF_NAME#v}.md" > "$NOTES_FILE"
+          else
+            : > "$NOTES_FILE"
+          fi
+          cat >> "$NOTES_FILE" <<EOF
+
+          macOS / Linux 在终端运行 \`curl -fsSL $DOWNLOAD/install.sh | sh\`；Windows 下载 \`setup.exe\` 双击安装，或在 PowerShell 运行 \`irm $DOWNLOAD/install.ps1 | iex\`。
+
+          内置 rill $RILL_VERSION（MIT，https://github.com/best-shuke/rill/releases/tag/$RILL_VERSION）。
+          内置的 geoip.metadb 和 GeoSite.dat 取自构建当天的 MetaCubeX/meta-rules-dat（GPL-3.0，https://github.com/MetaCubeX/meta-rules-dat）。
+          EOF
           gh release create "$GITHUB_REF_NAME" assets/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "FlowBar ${GITHUB_REF_NAME#v}" \
-            --notes "macOS / Linux 在终端运行 \`curl -fsSL $DOWNLOAD/install.sh | sh\`；Windows 下载 \`setup.exe\` 双击安装，或在 PowerShell 运行 \`irm $DOWNLOAD/install.ps1 | iex\`。
-
-          内置 rill $RILL_VERSION（MIT，https://github.com/best-shuke/rill/releases/tag/$RILL_VERSION）。
-          内置的 geoip.metadb 和 GeoSite.dat 取自构建当天的 MetaCubeX/meta-rules-dat（GPL-3.0，https://github.com/MetaCubeX/meta-rules-dat）。" \
+            --notes-file "$NOTES_FILE" \
             --generate-notes

@@ -67,6 +67,10 @@ xvfb-run -a dbus-run-session -- python3 scripts/tray-smoke-test.py
 # Linux 可以设置 FLOWBAR_AUTHORIZE=sudo 来代替 pkexec
 python3 scripts/privileged-smoke-test.py
 
+# macOS 专用后台服务：一次安装授权、重复连接、跨进程复用、拒绝无关客户端
+# CI 自动使用 sudo；本地运行会要求管理员密码，不覆盖已有服务
+python3 scripts/helper-smoke-test.py
+
 # 用已导入的配置完整启动、停止一次
 dist/FlowBar.app/Contents/MacOS/FlowBar --engine-smoke
 
@@ -99,6 +103,8 @@ CI 会把打包好的 macOS 应用存成 `FlowBar-macos-arm64` 附件，保留 1
 | --- | --- |
 | `src/config.rs` | 导入 YAML，生成运行配置 |
 | `src/engine.rs` | 连接流程和管理员授权 |
+| `src/privileged.rs` | macOS 的一次授权后台服务和双向身份验证 |
+| `src/logging.rs` | 有界日志、最近内容保留和子进程输出收集 |
 | `src/geo.rs` | 检查、复制和下载地理数据库 |
 | `src/supervisor.rs` | 监督内核运行，管理临时 DNS |
 | `src/process.rs` | 子进程生命周期 |

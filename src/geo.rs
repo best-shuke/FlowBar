@@ -5,10 +5,10 @@ use crate::{config, process, update};
 use anyhow::{Result, bail, ensure};
 use serde_yaml_ng::Value;
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
@@ -337,14 +337,7 @@ fn fetch(
     if !entry.ends_with('\n') {
         entry.push('\n');
     }
-    let mut options = fs::OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    // Probes run at once; one write per entry keeps their lines apart.
-    let _ = options
-        .open(log)
-        .and_then(|mut file| file.write_all(entry.as_bytes()));
+    crate::logging::record(log, entry);
     Ok(result
         .is_ok_and(|result| result.status.success())
         .then_some(output))

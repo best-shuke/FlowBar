@@ -39,7 +39,7 @@ pub struct Output {
     pub output: Vec<u8>,
 }
 /// Runs a short command without a persistent log, for the Unix administrator launch.
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 pub fn command(
     command: Command,
     timeout: Duration,
@@ -62,42 +62,58 @@ pub fn command_logged(
     mut progress: impl FnMut(&[u8]),
 ) -> Result<Output> {
     let mut options = fs::OpenOptions::new();
-    options.create_new(true).write(true);
+    options.create_new(true).read(true).write(true);
     #[cfg(unix)]
     options.mode(0o600);
     let log = options.open(path)?;
-    // A cloned file shares its offset with the child. Read through a separate handle
-    // so polling never moves the child's write position.
+    // Read through a separate handle so progress polling cannot move the writer's offset.
     let mut reader = fs::File::open(path)?;
     let result = (|| {
         ensure!(!cancelled.load(Ordering::SeqCst), "操作已取消");
         background(&mut command)
             .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log.try_clone()?));
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = ManagedChild::new(command.spawn()?);
+        let captures = crate::logging::capture(&mut child.0, &log)?;
         pid.store(child.0.id(), Ordering::SeqCst);
         let deadline = Instant::now() + timeout;
         let mut length = 0;
         let mut output = Vec::new();
-        let status = loop {
-            let status = child.0.try_wait()?;
-            let current = reader.metadata()?.len();
-            if current != length || status.is_some() {
-                reader.seek(SeekFrom::Start(current.saturating_sub(65536)))?;
-                output.clear();
-                (&mut reader).take(65536).read_to_end(&mut output)?;
-                progress(&output);
-                length = current;
-            }
-            ensure!(!cancelled.load(Ordering::SeqCst), "操作已取消");
-            if let Some(status) = status {
-                break status;
-            }
-            ensure!(Instant::now() < deadline, "操作超时，请查看日志。");
-            thread::sleep(Duration::from_millis(50));
-        };
-        Ok(Output { status, output })
+        let result = (|| {
+            let status = loop {
+                let status = child.0.try_wait()?;
+                let current = reader.metadata()?.len();
+                if current != length || status.is_some() {
+                    reader.seek(SeekFrom::Start(current.saturating_sub(65536)))?;
+                    output.clear();
+                    (&mut reader).take(65536).read_to_end(&mut output)?;
+                    progress(&output);
+                    length = current;
+                }
+                ensure!(!cancelled.load(Ordering::SeqCst), "操作已取消");
+                if let Some(status) = status {
+                    break status;
+                }
+                ensure!(Instant::now() < deadline, "操作超时，请查看日志。");
+                thread::sleep(Duration::from_millis(50));
+            };
+            Ok(Output { status, output })
+        })();
+        if result.is_err() {
+            child.stop();
+        }
+        for capture in captures {
+            let _ = capture.join();
+        }
+        let mut output = Vec::new();
+        let length = reader.metadata()?.len();
+        reader.seek(SeekFrom::Start(length.saturating_sub(65536)))?;
+        reader.take(65536).read_to_end(&mut output)?;
+        result.map(|mut result| {
+            result.output = output;
+            result
+        })
     })();
     pid.store(0, Ordering::SeqCst);
     result
@@ -436,32 +452,81 @@ pub fn supervise(
         });
     }
     background(&mut child_command);
+    if log.is_some() {
+        child_command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
     let mut child = ManagedChild::new(child_command.spawn().context("无法启动内核")?);
     // Best effort: a job that forbids nesting cannot take the core.
     #[cfg(windows)]
     let _job = kill_on_close(&child.0).ok();
-    on_started(child.0.id(), &signalled)?;
-    loop {
-        if let Some(status) = child.0.try_wait()? {
-            return Ok(status);
-        }
-        if stop_file.exists() || signalled.load(Ordering::SeqCst) || watch.parent_exited()? {
-            child.stop();
-            return Ok(child.0.wait()?);
-        }
-        if let Some(mut log) = log {
-            if log.metadata()?.len() > 2 * 1024 * 1024 {
-                log.set_len(0)?;
-                log.seek(SeekFrom::Start(0))?;
+    let captures = log
+        .map(|log| crate::logging::capture(&mut child.0, log))
+        .transpose()?
+        .unwrap_or_default();
+    let mut reason = "core exited";
+    let result = (|| {
+        on_started(child.0.id(), &signalled)?;
+        loop {
+            if let Some(status) = child.0.try_wait()? {
+                return Ok(status);
+            }
+            let stopping = stop_file.exists();
+            let signal = signalled.load(Ordering::SeqCst);
+            if stopping || signal || watch.parent_exited()? {
+                reason = if stopping {
+                    "stop requested"
+                } else if signal {
+                    "supervisor signalled"
+                } else {
+                    "application exited"
+                };
+                child.stop();
+                return Ok(child.0.wait()?);
             }
         }
+    })();
+    if result.is_err() {
+        child.stop();
     }
+    for capture in captures {
+        let _ = capture.join();
+    }
+    if let Some(log) = log {
+        let mut file = log.try_clone()?;
+        let message = format!(
+            "[FlowBar supervisor] core_pid={} parent_pid={parent} reason={reason} result={result:?}\n",
+            child.0.id()
+        );
+        crate::logging::write(&mut file, message.as_bytes())?;
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::bail;
+    #[cfg(unix)]
+    #[test]
+    fn noisy_command_keeps_recent_output_with_bounded_disk_and_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("burst.log");
+        let mut command = Command::new("/usr/bin/awk");
+        command.args(["BEGIN { for (i=0;i<30000;i++) { print i, \"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\"; print i, \"stderr-abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\" > \"/dev/stderr\" } print \"last-output\" }"]);
+        let output = command_logged(
+            command,
+            Duration::from_secs(10),
+            &AtomicBool::new(false),
+            &AtomicU32::new(0),
+            &log,
+            |_| {},
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(fs::metadata(&log).unwrap().len() <= crate::logging::LIMIT);
+        assert!(output.output.len() <= 65536);
+        assert!(String::from_utf8_lossy(&output.output).contains("last-output"));
+    }
     fn sleeper() -> Command {
         #[cfg(unix)]
         let mut c = Command::new("/bin/sleep");

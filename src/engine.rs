@@ -5,7 +5,9 @@ use crate::{
     process::{self, ManagedChild},
     supervisor, update,
 };
-use anyhow::{Context, Result, bail, ensure};
+#[cfg(not(target_os = "macos"))]
+use anyhow::Context;
+use anyhow::{Result, bail, ensure};
 use std::{
     collections::BTreeMap,
     fs,
@@ -48,23 +50,17 @@ pub struct Run {
     pub stage: PathBuf,
     pub status_path: PathBuf,
     pub cancelled: AtomicBool,
-    command_pid: AtomicU32,
+    pub(crate) command_pid: AtomicU32,
 }
 impl Run {
+    pub fn diagnostic(&self, message: impl AsRef<str>) {
+        crate::logging::record(&self.stage.join("session.log"), message);
+    }
     pub fn log(&self) -> PathBuf {
-        for path in [
-            self.stage.join("error.log"),
-            self.status_path.join("core.log"),
-            self.status_path.join("bootstrap.log"),
-            self.stage.join("authorization.log"),
-        ] {
-            if path.metadata().is_ok_and(|m| m.len() > 0) {
-                return path;
-            }
-        }
-        self.stage.join("validation.log")
+        self.stage.clone()
     }
     pub fn cancel(&self) {
+        self.diagnostic("stop requested by user or application exit");
         self.cancelled.store(true, Ordering::SeqCst);
         // Quit exits right after cancelling, before the worker thread can clean up.
         self.remove_config();
@@ -106,6 +102,10 @@ pub fn start(settings: Settings, emit: Emit) -> Result<Arc<Run>> {
     } else {
         stage.clone()
     };
+    #[cfg(unix)]
+    if settings.tun {
+        let _ = std::os::unix::fs::symlink(&status_path, stage.join("tun-logs"));
+    }
     let api = Api {
         port: settings.controller_port,
         secret: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
@@ -119,10 +119,30 @@ pub fn start(settings: Settings, emit: Emit) -> Result<Arc<Run>> {
         cancelled: AtomicBool::new(false),
         command_pid: AtomicU32::new(0),
     });
+    run.diagnostic(format!("session={} FlowBar={} os={} arch={} tun={} ipv6={} mode={} proxy_port={} controller_port={} dns_port={}", run.id, env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH, run.settings.tun, run.settings.ipv6, run.settings.mode, run.settings.proxy_port, run.settings.controller_port, run.settings.dns_port));
     let background = run.clone();
     thread::spawn(move || {
         background.prune();
-        let outcome = worker(&background, &emit);
+        let started = Instant::now();
+        let logged_emit: Emit = Arc::new({
+            let run = background.clone();
+            let emit = emit.clone();
+            move |event| {
+                if let Event::Progress(_, message) = &event {
+                    run.diagnostic(message);
+                }
+                emit(event);
+            }
+        });
+        let outcome = worker(&background, &logged_emit);
+        background.diagnostic(format!(
+            "worker finished after {} ms: {}",
+            started.elapsed().as_millis(),
+            outcome
+                .as_ref()
+                .map(|_| "stopped".into())
+                .unwrap_or_else(|e| format!("{e:#}"))
+        ));
         background.remove_config();
         match outcome {
             Ok(()) => emit(Event::Stopped(background.id.clone())),
@@ -143,7 +163,7 @@ pub fn start(settings: Settings, emit: Emit) -> Result<Arc<Run>> {
                     background.stage.join("download.log"),
                     background.stage.join("validation.log"),
                 ] {
-                    if let Ok(contents) = fs::read_to_string(&path) {
+                    if let Ok(contents) = crate::logging::tail(&path, 65536) {
                         message.push_str(&format!("\n{}\n{contents}\n", path.display()));
                     }
                 }
@@ -171,6 +191,7 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
     let data = config::home().join("Data");
     config::private_dir(&data)?;
     let core = supervisor::core()?;
+    run.diagnostic(format!("core={} data={}", core.display(), data.display()));
     ensure!(core.is_file(), "应用中缺少 rill 内核，请重新打包。");
     let resources = supervisor::resources()?;
     let progress = |message: String| emit(Event::Progress(run.id.clone(), message));
@@ -239,15 +260,24 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
         )
     );
     ensure!(!run.cancelled.load(Ordering::SeqCst), "操作已取消");
+    run.diagnostic(format!(
+        "configuration validation passed: {}",
+        output.status
+    ));
     let mut helper = None;
     if run.settings.tun {
         emit(Event::Progress(run.id.clone(), "等待管理员授权…".into()));
-        let output = elevate(run)?;
-        config::private_write(&run.stage.join("authorization.log"), &output.output)?;
-        ensure!(
-            output.status.success(),
-            "管理员启动失败，请打开日志查看具体原因。"
-        );
+        #[cfg(target_os = "macos")]
+        crate::privileged::launch(run)?;
+        #[cfg(not(target_os = "macos"))]
+        {
+            let output = elevate(run)?;
+            config::private_write(&run.stage.join("authorization.log"), &output.output)?;
+            ensure!(
+                output.status.success(),
+                "管理员启动失败，请打开日志查看具体原因。"
+            );
+        }
     } else {
         helper = Some(ManagedChild::new(
             Command::new(std::env::current_exe()?)
@@ -282,9 +312,17 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
     // Both supervisors read the stage copy before reporting running.
     run.remove_config();
     for (group, choice) in &run.settings.selections {
-        let _ = run.api.select(group, choice);
+        let result = run.api.select(group, choice);
+        run.diagnostic(format!(
+            "restore selection group={group:?} choice={choice:?}: {result:?}"
+        ));
     }
     let groups = run.api.groups(&run.group_order()).unwrap_or_default();
+    run.diagnostic(format!(
+        "controller ready; {} groups; status_path={}",
+        groups.len(),
+        run.status_path.display()
+    ));
     emit(Event::Ready(run.id.clone(), groups));
     loop {
         if run.cancelled.load(Ordering::SeqCst) {
@@ -365,31 +403,6 @@ fn validation_error(log: &str, data: &Path, fallback: &str) -> String {
     }
 }
 
-/// Starts the TUN supervisor through the system's administrator authorization, which
-/// returns once the core is ready or has failed.
-#[cfg(target_os = "macos")]
-fn elevate(run: &Run) -> Result<process::Output> {
-    let executable = std::env::current_exe()?;
-    let command = format!(
-        "{} --tun-launch {} {} {}",
-        process::shell_quote(executable.to_str().context("应用路径编码无效")?),
-        std::process::id(),
-        unsafe { libc::getuid() },
-        run.id
-    );
-    let script = format!(
-        "do shell script {} with administrator privileges",
-        process::apple_string(&command)
-    );
-    let mut authorization = Command::new("/usr/bin/osascript");
-    authorization.args(["-e", &script]);
-    process::command(
-        authorization,
-        Duration::from_secs(180),
-        &run.cancelled,
-        &run.command_pid,
-    )
-}
 #[cfg(target_os = "linux")]
 fn elevate(run: &Run) -> Result<process::Output> {
     let pkexec = ["/usr/bin/pkexec", "/bin/pkexec"]

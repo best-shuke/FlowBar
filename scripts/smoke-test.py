@@ -28,14 +28,15 @@ else:
     HOME = Path.home() / '.local/share/flowbar'
 DATA = HOME / 'Data'
 TOKEN = 'flowbar-local-smoke-test-token'
-PORTS = (17890, 19090, 15353)
-
-for port in PORTS:
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1', port))
+sockets = [socket.socket() for _ in range(3)]
+for sock in sockets:
+    sock.bind(('127.0.0.1', 0))
+PROXY_PORT, CONTROLLER_PORT, DNS_PORT = [sock.getsockname()[1] for sock in sockets]
+for sock in sockets:
+    sock.close()
 
 def api(path, method='GET', body=None, authorized=True):
-    conn = http.client.HTTPConnection('127.0.0.1', 19090, timeout=2)
+    conn = http.client.HTTPConnection('127.0.0.1', CONTROLLER_PORT, timeout=2)
     headers = {'Authorization': 'Bearer ' + TOKEN} if authorized else {}
     if body is not None:
         body = json.dumps(body).encode()
@@ -49,6 +50,12 @@ def api(path, method='GET', body=None, authorized=True):
 def render(source, target, tun=False):
     subprocess.run([str(GUI), '--render', str(source), str(target)] + (['--tun'] if tun else []),
                    check=True, capture_output=True)
+    # --render uses the application's default ports; isolate each test instance.
+    text = target.read_text(encoding='utf-8')
+    text = text.replace('mixed-port: 17890', f'mixed-port: {PROXY_PORT}')
+    text = text.replace('127.0.0.1:19090', f'127.0.0.1:{CONTROLLER_PORT}')
+    text = text.replace('127.0.0.1:15353', f'127.0.0.1:{DNS_PORT}')
+    target.write_text(text, encoding='utf-8')
 
 def validate(path, directory):
     result = subprocess.run([str(CORE), '-t', '-d', str(directory), '-f', str(path)],
@@ -105,7 +112,7 @@ with tempfile.TemporaryDirectory(prefix='flowbar-smoke-') as temp:
             try:
                 assert api('/version', authorized=False)[0] == 401
                 current = api('/configs')[1]
-                assert current['mode'] == 'rule' and current['mixed-port'] == 17890
+                assert current['mode'] == 'rule' and current['mixed-port'] == PROXY_PORT
                 assert current['tun']['enable'] is False
                 assert api('/configs', 'PATCH', {'mode': 'global'})[0] == 204
                 assert api('/configs')[1]['mode'] == 'global'
@@ -144,12 +151,12 @@ rules:
     with (temp / 'loopback-core.log').open('wb') as log:
         process = launch(runtime, temp, log)
         try:
-            conn = http.client.HTTPConnection('127.0.0.1', 17890, timeout=3)
+            conn = http.client.HTTPConnection('127.0.0.1', PROXY_PORT, timeout=3)
             conn.request('GET', f'http://127.0.0.1:{server.server_port}/probe')
             response = conn.getresponse()
             assert response.status == 200 and response.read() == b'flowbar-direct-ok'
             conn.close()
-            conn = http.client.HTTPConnection('127.0.0.1', 17890, timeout=3)
+            conn = http.client.HTTPConnection('127.0.0.1', PROXY_PORT, timeout=3)
             conn.request('GET', 'http://blocked.flowbar.invalid/')
             try:
                 response = conn.getresponse()

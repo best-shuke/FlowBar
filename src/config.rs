@@ -369,7 +369,7 @@ pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> 
     );
     set(map, "secret", secret);
     set(map, "mode", settings.mode.as_str());
-    set(map, "log-level", "warning");
+    set(map, "log-level", "debug");
     set(map, "geodata-loader", "memconservative");
     // FlowBar's setting decides IPv6, whatever the profile says.
     set(map, "ipv6", settings.ipv6);

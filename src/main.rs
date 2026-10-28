@@ -5,6 +5,9 @@ mod api;
 mod config;
 mod engine;
 mod geo;
+mod logging;
+#[cfg(target_os = "macos")]
+mod privileged;
 mod process;
 mod supervisor;
 mod ui;
@@ -35,6 +38,14 @@ fn entry() -> Result<()> {
         console::attach();
     }
     match arguments.first().map(String::as_str) {
+        #[cfg(target_os = "macos")]
+        Some("--install-tun-helper") if arguments.len() == 2 => {
+            privileged::install(arguments[1].parse()?)?
+        }
+        #[cfg(target_os = "macos")]
+        Some("--tun-helper") if arguments.len() == 2 => privileged::serve(arguments[1].parse()?)?,
+        #[cfg(target_os = "macos")]
+        Some("--tun-helper-smoke") => privileged::smoke()?,
         Some("--version") => println!("FlowBar {} (Rust, {TOOLKIT})", env!("CARGO_PKG_VERSION")),
         #[cfg(unix)]
         Some("--tun-launch") if arguments.len() == 4 => {

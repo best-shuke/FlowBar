@@ -54,7 +54,14 @@ EOF
 
 macOS 和 Linux 上，卸载前先在设置里关掉「登录时打开」，再退出 FlowBar。
 
-- **macOS**：把 `FlowBar.app` 移到废纸篓。
+- **macOS**：把 `FlowBar.app` 移到废纸篓。使用过 TUN 后，可在终端移除当前用户的后台服务（会要求管理员密码）：
+
+  ```sh
+  sudo launchctl bootout "system/dev.local.FlowBar.tun.$(id -u)"
+  sudo rm -f "/Library/LaunchDaemons/dev.local.FlowBar.tun.$(id -u).plist"
+  sudo rm -rf "/Library/Application Support/FlowBar/$(id -u)/Helper"
+  sudo rm -f "/Library/Application Support/FlowBar/$(id -u)/helper.sock"
+  ```
 - **Windows**：在「设置 → 应用」里卸载 FlowBar，它会一并移除开始菜单快捷方式和登录启动项。手动安装的直接删掉目录。
 - **Linux**：删除 `~/.local/opt/FlowBar` 和 `~/.local/share/applications/dev.local.FlowBar.desktop`。
 
@@ -63,14 +70,14 @@ macOS 和 Linux 上，卸载前先在设置里关掉「登录时打开」，再�
 ## 使用
 
 1. 打开 FlowBar，从菜单或设置里导入 YAML 配置。支持 YAML 锚点和合并键。
-2. 点「启动连接」。TUN 模式要管理员权限，会弹出系统授权：macOS 是授权窗口，Windows 是 UAC，Linux 是 polkit。
+2. 点「启动连接」。TUN 模式要管理员权限：macOS 首次连接时授权安装后台服务，后续连接、切换配置和登录后自动连接无需重复输入密码；应用升级后首次连接需授权升级服务。Windows 使用 UAC，Linux 使用 polkit。
 3. 连上以后在菜单里选模式、策略组和节点。关掉设置窗口后 FlowBar 仍在后台运行。
 
 另外几点：
 
 - 开 TUN 前先退出其他代理客户端（比如 Clash Verge），否则路由会冲突。
 - TUN 默认开启。关掉 TUN 后 FlowBar 不会改系统代理，需要在各个程序里自己填代理地址。
-- 现在还没有常驻的提权服务，所以登录后自动连接 TUN 时也会弹授权。
+- macOS 后台服务由 launchd 管理，重启后仍可复用；如果系统禁用了后台项目，请在「系统设置 → 通用 → 登录项与扩展」中允许 FlowBar。
 - 暂时没有订阅管理，订阅更新后重新导入同名文件，选「替换」。
 
 默认端口如下，可以在设置里改：
@@ -89,7 +96,7 @@ macOS 和 Linux 上，卸载前先在设置里关掉「登录时打开」，再�
 
 ### 多份配置
 
-每导入一个 YAML 文件就多一份配置，以文件名命名。在菜单的「配置」子菜单或设置窗口的下拉列表里切换。连接开着时切换，FlowBar 会断开后用新配置重新连接，TUN 模式下会再请求一次管理员授权。每份配置各自记住选过的节点。
+每导入一个 YAML 文件就多一份配置，以文件名命名。在菜单的「配置」子菜单或设置窗口的下拉列表里切换。连接开着时切换，FlowBar 会断开后用新配置重新连接，macOS 会复用已授权的后台服务，Windows 和 Linux 会重新请求管理员授权。每份配置各自记住选过的节点。
 
 导入的文件和已有配置同名（不区分大小写）时，可以替换原来的那份，比如订阅更新后；也可以另存为新配置，比如两个机场的文件都叫 `config.yaml`。不再需要的配置在「配置」子菜单里删除，只会删掉 FlowBar 保存的副本。
 
@@ -137,6 +144,10 @@ IPv6 默认关闭，不管导入的配置里怎么写：内核不用 IPv6 解析
 | `settings.json` | 端口、模式、IPv6、自启和节点选择 |
 | `Data/` | Geo 数据库、provider 文件和缓存 |
 | `Sessions/` | 每次连接的日志和状态，只保留最近 5 次 |
+
+菜单中的「打开日志」打开当前或最后一次会话目录。`session.log` 记录毫秒时间戳、版本、端口、启动进度、授权服务、节点操作、测速结果和完整错误链；`core.log` 使用 debug 级别，`validation.log` 记录配置检查，`download.log` 记录数据库下载。TUN 会话里的 `tun-logs` 链接通向管理员运行目录。日志不会主动写入完整配置或控制密钥；内核 debug 日志会包含连接目标，分享前请检查。
+
+每个日志文件最多 2 MiB，写满后丢弃较早部分，保留最近约 1 MiB 并继续写入。清理旧会话时会删除对应日志，因此持续运行也不会无限增长。
 
 ## 安全
 

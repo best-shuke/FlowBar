@@ -53,7 +53,7 @@ irm https://github.com/best-shuke/FlowBar/releases/latest/download/install.ps1 |
 ## 快速上手
 
 1. 打开 FlowBar，导入你的 YAML 配置。
-2. 点「启动连接」。TUN 模式会请求一次管理员权限。
+2. 点「启动连接」。macOS 首次使用 TUN 时会授权安装后台服务，此后连接无需重复输入密码（应用更新后需要授权升级服务）。
 3. 在菜单栏或托盘菜单里切换模式和节点。想看节点快慢，在策略组里点「测试延迟」。
 
 开 TUN 之前先退出其他代理客户端，避免路由冲突。连不上的话，先从菜单打开日志看看原因，常见问题见[使用说明](docs/guide.md#常见问题)。
