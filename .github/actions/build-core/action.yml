@@ -31,6 +31,11 @@ runs:
         rustup toolchain install "$tc" --profile minimal --component clippy,rustfmt --no-self-update
         rustup target add --toolchain "$tc" "${{ inputs.target }}"
         echo "RUSTUP_TOOLCHAIN=$tc" >> "$GITHUB_ENV"
+    - name: Install NASM for BoringSSL
+      if: runner.os == 'Windows'
+      uses: ilammy/setup-nasm@v1
+      with:
+        version: 2.16.01
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: |

@@ -19,6 +19,7 @@ jobs:
   build:
     name: ${{ matrix.system }}-${{ matrix.arch }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-15
