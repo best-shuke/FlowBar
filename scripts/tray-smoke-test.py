@@ -115,6 +115,9 @@ with tempfile.TemporaryDirectory(prefix='flowbar-tray-') as temp:
         'proxyPort': ports[0], 'controllerPort': ports[1], 'dnsPort': ports[2]}))
     (data / 'profile.yaml').write_text('proxies: []\nproxy-groups:\n  - name: 策略\n    type: select\n'
                                        '    proxies: [DIRECT, REJECT]\nrules: ["MATCH,DIRECT"]\n')
+    (data / 'Profiles').mkdir(mode=0o700)
+    (data / 'Profiles/备用.yaml').write_text('proxies: []\nproxy-groups:\n  - name: 备用组\n'
+                                         '    type: select\n    proxies: [DIRECT]\nrules: ["MATCH,DIRECT"]\n')
     env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'))
     app = subprocess.Popen([str(home / 'FlowBar/flowbar')], env=env,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -136,12 +139,20 @@ with tempfile.TemporaryDirectory(prefix='flowbar-tray-') as temp:
         call(service, menu, 'com.canonical.dbusmenu', 'AboutToShow', GLib.Variant('(i)', (0,)))
         assert pump(10, lambda: '策略组与节点' in layout(service, menu)), 'Groups did not appear'
         # Latencies appear only after a test, which the core runs for a whole group.
-        delays = lambda: [label for label in layout(service, menu) if '\t' in label]
+        delays = lambda: [label for label in layout(service, menu) if '    ' in label]
         assert not delays() and '测试延迟' in layout(service, menu)
         click(service, menu, '测试延迟')
-        assert pump(15, lambda: any(label.startswith('REJECT\t') for label in delays())), delays()
-        assert any(label == 'REJECT\t超时' for label in delays()), delays()
+        assert pump(15, lambda: any(label.startswith('REJECT    ') for label in delays())), delays()
+        assert 'REJECT    超时' in delays(), delays()
         print('PASS tray menu tests node latency on request')
+        click(service, menu, '备用')
+        assert pump(30, lambda: '配置：备用' in layout(service, menu)
+                    and any(label.startswith('备用组') for label in layout(service, menu)))
+        assert not any(label.startswith('策略 →') for label in layout(service, menu))
+        click(service, menu, '托盘测试')
+        assert pump(30, lambda: '配置：托盘测试' in layout(service, menu)
+                    and any(label.startswith('策略 →') for label in layout(service, menu)))
+        print('PASS tray menu refreshes groups after switching profiles without reopening')
         click(service, menu, '全局代理')
         settings = data / 'settings.json'
         assert pump(10, lambda: json.loads(settings.read_text())['mode'] == 'global')

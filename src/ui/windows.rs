@@ -61,21 +61,22 @@ use windows_sys::Win32::{
             CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, CW_USEDEFAULT, CreateIconIndirect,
             CreatePopupMenu, CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyIcon, DestroyMenu,
             DestroyWindow, DispatchMessageW, EN_KILLFOCUS, ES_AUTOHSCROLL, ES_NUMBER, FindWindowW,
-            GetDlgCtrlID, GetDlgItem, GetMenuItemCount, GetMessageW, GetSystemMetrics,
-            GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HICON, HMENU, ICONINFO,
-            IDC_ARROW, IDCANCEL, IDOK, IMAGE_ICON, IsDialogMessageW, IsIconic, KillTimer,
-            LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MB_OK, MB_OKCANCEL, MB_SETFOREGROUND,
-            MF_BYPOSITION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
-            MessageBoxW, MoveWindow, NONCLIENTMETRICSW, PostMessageW, PostQuitMessage,
-            RegisterClassExW, RegisterWindowMessageW, SM_CXICON, SM_CXSMICON,
+            GetDlgCtrlID, GetDlgItem, GetMenuItemCount, GetMenuStringW, GetMessageW, GetSubMenu,
+            GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+            HICON, HMENU, ICONINFO, IDC_ARROW, IDCANCEL, IDOK, IMAGE_ICON, IsDialogMessageW,
+            IsIconic, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MB_OK, MB_OKCANCEL,
+            MB_SETFOREGROUND, MF_BYPOSITION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
+            MF_STRING, MSG, MessageBoxW, MoveWindow, NONCLIENTMETRICSW, PostMessageW,
+            PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SM_CXICON, SM_CXSMICON,
             SPI_GETNONCLIENTMETRICS, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE,
             SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos,
             SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
-            TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLORBTN,
-            WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_INITMENUPOPUP,
-            WM_NCDESTROY, WM_NULL, WM_PAINT, WM_PRINTCLIENT, WM_SETFONT, WM_TIMER, WNDCLASSEXW,
-            WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED,
-            WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+            TranslateMessage, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
+            WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND,
+            WM_INITMENUPOPUP, WM_NCDESTROY, WM_NULL, WM_PAINT, WM_PRINTCLIENT, WM_SETFONT,
+            WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
+            WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+            WS_VSCROLL,
         },
     },
 };
@@ -288,6 +289,49 @@ struct Popup {
 }
 
 impl Shell for Win {
+    fn verify_smoke_render(&self) {
+        let view = self.app.view();
+        if let Some(hwnd) = self.settings_hwnd() {
+            let index = unsafe { SendMessageW(GetDlgItem(hwnd, PROFILE), CB_GETCURSEL, 0, 0) };
+            assert_eq!(usize::try_from(index).ok(), view.profile_index);
+            assert_eq!(text(unsafe { GetDlgItem(hwnd, STATS) }), view.stats);
+        }
+        if self.app.ui.borrow().delays.values().any(Option::is_none) {
+            let menu = unsafe { CreatePopupMenu() };
+            let mut popup = Popup {
+                actions: vec![],
+                groups: null_mut(),
+            };
+            for entry in self.app.group_entries() {
+                append(menu, &entry, &mut popup);
+            }
+            fn has_timeout(menu: HMENU) -> bool {
+                for index in 0..unsafe { GetMenuItemCount(menu) } {
+                    let mut label = [0u16; 1024];
+                    let length = unsafe {
+                        GetMenuStringW(
+                            menu,
+                            index as u32,
+                            label.as_mut_ptr(),
+                            label.len() as i32,
+                            MF_BYPOSITION,
+                        )
+                    };
+                    if String::from_utf16_lossy(&label[..length as usize]).ends_with("\t超时") {
+                        return true;
+                    }
+                    let child = unsafe { GetSubMenu(menu, index) };
+                    if !child.is_null() && has_timeout(child) {
+                        return true;
+                    }
+                }
+                false
+            }
+            let complete = has_timeout(menu);
+            unsafe { DestroyMenu(menu) };
+            assert!(complete, "native menu clipped or lost the timeout label");
+        }
+    }
     fn render(&self) {
         let view = self.app.view();
         self.update_tray(&view);
@@ -347,13 +391,13 @@ impl Shell for Win {
         self.place_status(hwnd, &view.message);
     }
     fn show_settings(&self) {
+        self.app.load_summary();
         let hwnd = match self.settings_hwnd() {
             Some(hwnd) => hwnd,
             None => {
                 let Some(hwnd) = self.make_window() else {
                     return;
                 };
-                self.app.load_summary();
                 hwnd
             }
         };
@@ -1211,6 +1255,12 @@ unsafe extern "system" fn settings_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_ACTIVATE if wparam & 0xFFFF != 0 => {
+            with_shell(|shell| {
+                shell.app.load_summary();
+                shell.render();
+            });
+        }
         WM_COMMAND => {
             let (id, code) = ((wparam & 0xFFFF) as i32, ((wparam >> 16) & 0xFFFF) as u32);
             with_shell(|shell| shell.command(id, code));

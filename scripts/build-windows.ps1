@@ -39,7 +39,7 @@ try {
     Copy-Item Resources\legacy-core-placeholder.txt "$app\mihomo.exe"
     Copy-Item Resources\THIRD_PARTY.md, Resources\LICENSE-RILL, Resources\NOTICE-RILL, Resources\LICENSE-GPL-3.0 $app
     $coreDirectory = Split-Path $Core
-    foreach ($notice in 'LICENSE-RILL-THIRD-PARTY.txt', 'LICENSE-WINTUN.txt') {
+    foreach ($notice in 'LICENSE-RILL-THIRD-PARTY.txt', 'LICENSE-WINTUN.txt', 'CORE-REVISION.txt') {
         if (Test-Path "$coreDirectory\$notice") { Copy-Item "$coreDirectory\$notice" $app }
     }
     if ($Geo) { Copy-Item "$Geo\geoip.metadb", "$Geo\GeoSite.dat" $app }

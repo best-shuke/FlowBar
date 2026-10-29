@@ -4,6 +4,7 @@ dist/
 *.local.yaml
 .agent-artifacts/
 target/
+.rill/
 *.app/
 *.log
 __pycache__/

@@ -34,6 +34,9 @@ cp Resources/LICENSE-RILL Resources/NOTICE-RILL Resources/LICENSE-GPL-3.0 "$APP/
 if [[ -f "${CORE:h}/LICENSE-RILL-THIRD-PARTY.txt" ]]; then
     cp "${CORE:h}/LICENSE-RILL-THIRD-PARTY.txt" "$APP/Contents/Resources/"
 fi
+if [[ -f "${CORE:h}/CORE-REVISION.txt" ]]; then
+    cp "${CORE:h}/CORE-REVISION.txt" "$APP/Contents/Resources/"
+fi
 python3 scripts/licenses.py "$APP/Contents/Resources/LICENSE-RUST-DEPENDENCIES.txt"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 codesign --force --sign - "$APP/Contents/Resources/rill"

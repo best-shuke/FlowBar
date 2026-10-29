@@ -30,6 +30,9 @@ install -m 644 Resources/linux/flowbar.png Resources/THIRD_PARTY.md Resources/LI
 if [[ -f "$(dirname "$CORE")/LICENSE-RILL-THIRD-PARTY.txt" ]]; then
     install -m 644 "$(dirname "$CORE")/LICENSE-RILL-THIRD-PARTY.txt" "$APP/"
 fi
+if [[ -f "$(dirname "$CORE")/CORE-REVISION.txt" ]]; then
+    install -m 644 "$(dirname "$CORE")/CORE-REVISION.txt" "$APP/"
+fi
 if [[ $# -ge 2 ]]; then
     install -m 644 "$2/geoip.metadb" "$2/GeoSite.dat" "$APP/"
 fi

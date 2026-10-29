@@ -187,6 +187,8 @@ pub trait Shell {
     fn smoke_delay(&self, _group: &str) -> bool {
         false
     }
+    /// Check the native widgets during the isolated cross-platform UI smoke test.
+    fn verify_smoke_render(&self) {}
     /// Sends [`update::Event::Due`] after ten seconds and then hourly.
     fn schedule_updates(&self);
     fn snapshot(&self, _path: &Path) {}
@@ -336,9 +338,10 @@ impl App {
     pub fn stopped(&self) -> bool {
         matches!(self.ui.borrow().phase, Phase::Stopped | Phase::Failed)
     }
-    /// Reloads the profile counts shown in a newly opened settings window.
+    /// Reloads profiles and counts when the settings window opens or regains focus.
     pub fn load_summary(&self) {
         let mut ui = self.ui.borrow_mut();
+        ui.profiles = config::profiles();
         ui.summary = profile_summary(&ui.settings.profile_name);
     }
     /// Whether the settings window should overwrite its port fields even while one is being
@@ -536,6 +539,7 @@ impl App {
             ui.phase = Phase::Starting;
             ui.message = "正在检查配置…".into();
         }
+        shell.groups_changed();
         shell.render();
         Ok(())
     }
@@ -578,6 +582,7 @@ impl App {
                     }
                     Event::Ready(id, groups) if current.as_deref() == Some(&id) => {
                         ui.groups = groups;
+                        groups_changed = true;
                         ui.phase = Phase::Running;
                         ui.message = if ui.settings.tun {
                             "TUN 已连接"
@@ -588,12 +593,14 @@ impl App {
                     }
                     Event::Stopped(id) if current.as_deref() == Some(&id) => {
                         ui.end_run();
+                        groups_changed = true;
                         ui.phase = Phase::Stopped;
                         ui.message = "已停止".into();
                         restart = std::mem::take(&mut ui.reconnect);
                     }
                     Event::Failed(id, message) if current.as_deref() == Some(&id) => {
                         ui.end_run();
+                        groups_changed = true;
                         ui.reconnect = false;
                         ui.phase = Phase::Failed;
                         // Keep the tray menu and two-line footer short; recovery steps
@@ -624,6 +631,7 @@ impl App {
                     {
                         ui.operation = false;
                         ui.groups = groups;
+                        groups_changed = true;
                         ui.settings.selections.insert(group, choice);
                         error = ui.settings.save().err();
                     }
@@ -743,6 +751,9 @@ impl App {
     }
     fn advance_smoke(&self, shell: &dyn Shell) {
         const GROUP: &str = "策略 / 测试";
+        if self.ui.borrow().smoke_step.is_some() {
+            shell.verify_smoke_render();
+        }
         let (step, action) = {
             let ui = self.ui.borrow();
             let Some(step) = ui.smoke_step else {
@@ -777,7 +788,8 @@ impl App {
                 // The other profile has no node choices of its own yet.
                 6 if running && ui.settings.selections.is_empty() => other(),
                 7 if running && selection == Some("DIRECT") => Some(Action::Connect),
-                8 if ui.phase == Phase::Stopped => Some(Action::Quit),
+                8 | 9 if ui.phase == Phase::Stopped => other(),
+                10 if ui.phase == Phase::Stopped => Some(Action::Quit),
                 _ => None,
             };
             (step, action)
@@ -806,6 +818,10 @@ impl App {
         if let Err(error) = self.act(shell, action) {
             eprintln!("FAIL Rust UI smoke: {error:#}");
             std::process::exit(1);
+        }
+        // Switching a stopped profile is synchronous and emits no worker event.
+        if self.stopped() {
+            self.advance_smoke(shell);
         }
     }
     pub fn save_options(&self, shell: &dyn Shell) -> Result<()> {

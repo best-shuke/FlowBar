@@ -12,8 +12,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The bundled core: a rill release (https://github.com/best-shuke/rill/releases).
-  RILL_VERSION: v0.1.4
+  RILL_VERSION: v0.1.5
+  RILL_REVISION: b781566560480bb4e826fc9200d965c333612421
 
 jobs:
   test:
@@ -25,15 +25,12 @@ jobs:
           - os: macos-15
             system: macos
             target_core: aarch64-apple-darwin
-            sha256: 840683df45bb135d51eb5e34589e57e399c16a78cd360fd62413d86cdfc97abf
           - os: ubuntu-22.04
             system: linux
             target_core: x86_64-unknown-linux-musl
-            sha256: 3e80869d9cf04df17529a954d811442e09cf322501d673e6e1c772b68cf5028e
           - os: windows-2022
             system: windows
             target_core: x86_64-pc-windows-msvc
-            sha256: 529c5c9c0ac1b4b91286b663953ce9febc74631754ae176b16ca589af8130e1a
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -50,6 +47,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev xvfb dbus python3-gi
 
+      - uses: ./.github/actions/build-core
+        with:
+          revision: ${{ env.RILL_REVISION }}
+          target: ${{ matrix.target_core }}
+
       - name: Lint
         run: |
           rustup component add clippy rustfmt
@@ -62,7 +64,6 @@ jobs:
       - name: Package
         id: package
         run: |
-          ./scripts/fetch-rill.sh "$RILL_VERSION" ${{ matrix.target_core }} ${{ matrix.sha256 }} "$(dirname "$CORE")"
           ./scripts/fetch-geo.sh "$RUNNER_TEMP/geo"
           case ${{ matrix.system }} in
             macos) ./scripts/build.sh "$CORE" "$RUNNER_TEMP/geo" ;;

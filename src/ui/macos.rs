@@ -106,7 +106,10 @@ define_class!(
         fn close_settings(&self, _notification: &NSNotification) { self.close_window(); }
         /// Picks up a login item approved in System Settings while the window was in the background.
         #[unsafe(method(windowDidBecomeKey:))]
-        fn settings_key(&self, _notification: &NSNotification) { self.render(); }
+        fn settings_key(&self, _notification: &NSNotification) {
+            self.ivars().app.load_summary();
+            self.render();
+        }
     }
     impl Delegate {
         #[unsafe(method(menuAction:))]
@@ -302,6 +305,23 @@ impl Shell for Delegate {
                 };
                 // Result titles have been refreshed while the real menu is tracking.
                 assert!(menu.itemAtIndex(2).unwrap().attributedTitle().is_some());
+                let entries = delegate.ivars().app.group_entries();
+                let Entry::Menu { entries, .. } = &entries[0] else {
+                    unreachable!()
+                };
+                assert!(
+                    menu.size().width >= tab_location(entries) + 48.0,
+                    "open latency menu clipped its result column"
+                );
+                assert!(
+                    menu.itemAtIndex(3)
+                        .unwrap()
+                        .attributedTitle()
+                        .unwrap()
+                        .string()
+                        .to_string()
+                        .ends_with("超时")
+                );
                 menu.cancelTracking();
             }
         }
@@ -339,6 +359,25 @@ impl Shell for Delegate {
         self.ivars().app.ui.borrow_mut().smoke_step = Some(5);
         self.ivars().app.advance_smoke(self);
         true
+    }
+    fn verify_smoke_render(&self) {
+        let view = self.ivars().app.view();
+        let mac = self.ivars().mac.borrow();
+        if let Some((_, shown)) = &mac.groups_menu {
+            assert_eq!(
+                shown,
+                &self.ivars().app.ui.borrow().groups,
+                "open node menu still shows the previous profile"
+            );
+        }
+        if let Some(window) = &mac.window {
+            let selected = window.profiles.titleOfSelectedItem().map(|s| s.to_string());
+            assert_eq!(
+                selected.as_ref(),
+                view.profile_index.map(|i| &view.profiles[i])
+            );
+            assert_eq!(window.stats.stringValue().to_string(), view.stats);
+        }
     }
     fn render(&self) {
         let view = self.ivars().app.view();
@@ -633,6 +672,19 @@ impl Delegate {
     ) {
         let mtm = self.mtm();
         let tab = tab_location(&entries);
+        if entries.iter().any(|entry| {
+            matches!(
+                entry,
+                Entry::Item {
+                    action: Some(Action::Select(..)),
+                    ..
+                }
+            )
+        }) {
+            // NSMenu keeps its tracking width while async results arrive. Reserve the
+            // result column before the first test, including the checkmark and margins.
+            menu.setMinimumWidth(tab + 48.0);
+        }
         for entry in entries {
             match entry {
                 Entry::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
@@ -1070,18 +1122,26 @@ fn set_title(item: &NSMenuItem, title: &str, detail: Option<&str>, tab: f64) {
 /// Where the details of a menu's items end: past its widest title and detail, and a gap.
 fn tab_location(entries: &[Entry]) -> f64 {
     let width = |text: &str| menu_text(text, None).size().width;
-    entries
-        .iter()
-        .filter_map(|entry| match entry {
-            Entry::Item {
-                title,
-                detail: Some(detail),
-                ..
-            } => Some(width(title) + width(detail)),
-            _ => None,
-        })
-        .fold(0.0, f64::max)
-        + 24.0
+    let mut title_width: f64 = 0.0;
+    // Delays are u16, so this covers every result as well as the CJK timeout label.
+    let mut detail_width = width("65535 ms").max(width("超时"));
+    for entry in entries {
+        if let Entry::Item {
+            title,
+            detail,
+            action,
+            ..
+        } = entry
+        {
+            if detail.is_some() || matches!(action, Some(Action::Select(..))) {
+                title_width = title_width.max(width(title));
+                if let Some(detail) = detail {
+                    detail_width = detail_width.max(width(detail));
+                }
+            }
+        }
+    }
+    (title_width + detail_width + 24.0).ceil()
 }
 /// Text in the menu font, which an attributed title does not use by default.
 fn menu_text(text: &str, style: Option<&NSParagraphStyle>) -> Retained<NSAttributedString> {

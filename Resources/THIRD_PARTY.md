@@ -4,7 +4,8 @@ separate process. No Swift code or WebView is used by this build.
 
 rill: https://github.com/best-shuke/rill (MIT), a Rust proxy core that reads mihomo
 configurations, derived from meow-rs (https://github.com/meow-rs/meow-rs, MIT).
-Release builds bundle an unmodified rill release binary; the release notes name its version.
+Release builds compile a pinned rill source commit with the XPro feature enabled;
+the release notes name its version and commit, also saved in CORE-REVISION.txt.
 The bundled core's exact version can be checked with `rill -v`
 (Contents/Resources/rill on macOS, next to the FlowBar executable elsewhere).
 LICENSE-RILL and NOTICE-RILL contain its license and origin. The notices of the code it is

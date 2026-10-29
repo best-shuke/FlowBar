@@ -15,6 +15,15 @@ cp -R dist/FlowBar.app ~/Applications/
 
 不传路径时，脚本会依次查找已安装的 FlowBar 自带的内核和 PATH 里的 rill。
 
+调试内核或需要 XPro 时，先从包含相应修复的 rill 源码构建，再显式打包这个内核：
+
+```sh
+./scripts/build-core.sh ../rill
+./scripts/build.sh .agent-artifacts/core/rill
+```
+
+`build-core.sh` 启用 `xpro` 并生成对应的第三方许可声明。第三个参数可指定目标三元组，Linux musl 构建需要 Zig 和 cargo-zigbuild。XPro 不在 rill 的默认 `full` 功能集中，打包时应显式使用新构建的内核。原生构建完成后会运行 DNS 节点切换和 XPro 加载测试。
+
 想像 Release 一样内置地理数据库，先运行 `./scripts/fetch-geo.sh /path/to/geo`，再把这个目录作为第二个参数传给构建脚本，Windows 上用 `-Geo` 参数。不传的话，安装包里没有数据库，第一次连接时由 FlowBar 下载。
 
 **Windows**（另需带 Windows SDK 的 Visual Studio 生成工具），在 PowerShell 里：
@@ -89,11 +98,13 @@ CI 会把打包好的 macOS 应用存成 `FlowBar-macos-arm64` 附件，保留 1
 2. 提交并推送，等 CI 通过。
 3. 打标签并推送：`git tag v0.3.0 && git push origin v0.3.0`。
 
-推送标签后，`.github/workflows/release.yml` 会核对版本号，下载并校验固定版本的 rill 和当天的地理数据库，跑一遍测试，然后构建 5 个压缩包（macOS arm64、Windows x86_64 / ARM64、Linux x86_64 / ARM64）和 2 个 Windows 安装程序，连同 `scripts/install.sh`、`scripts/install.ps1` 一起发布 Release。安装脚本总是取最新的 Release，文档里也用 `releases/latest/download/` 链接它们。仓库必须是公开的，应用和安装脚本才能读到 Release。
+推送标签后，`.github/workflows/release.yml` 会核对版本号，从固定提交构建启用 XPro 的 rill，并下载当天的地理数据库，跑一遍测试，然后构建 5 个压缩包（macOS arm64、Windows x86_64 / ARM64、Linux x86_64 / ARM64）和 2 个 Windows 安装程序，连同 `scripts/install.sh`、`scripts/install.ps1` 一起发布 Release。安装脚本总是取最新的 Release，文档里也用 `releases/latest/download/` 链接它们。仓库必须是公开的，应用和安装脚本才能读到 Release。
 
 应用内更新下载的是压缩包，靠 `FlowBar-<版本>-<系统>-<架构>.zip` / `.tar.gz` 这个文件名找到它，不能改名。
 
-升级内置的 rill 时，要同时修改 `release.yml` 和 `ci.yml` 里的 `RILL_VERSION` 和各平台的 `sha256`（rill Release 的 `SHA256SUMS` 里有）。
+升级内置的 rill 时，要同时修改 `release.yml` 和 `ci.yml` 里的 `RILL_VERSION` 和 `RILL_REVISION`（完整提交 SHA）。`.github/actions/build-core` 统一构建内核，包内 `CORE-REVISION.txt` 记录源码提交。
+
+在 GitHub Actions 手动运行 Release 工作流，会构建所有平台并创建带附件的草稿 Release；推送版本标签则正式发布。发布前应确认 CI 和各平台的界面测试均通过。
 
 安装包里还有一个名为 `mihomo`（Windows 上是 `mihomo.exe`）的占位文本文件，内容见 `Resources/legacy-core-placeholder.txt`：FlowBar 0.4.0 及更早版本的应用内更新会检查新安装包里有没有 mihomo 内核，旧版安装程序留下的卸载程序也靠它认出安装目录。等不再需要从这些版本升级时可以去掉。
 

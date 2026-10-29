@@ -83,6 +83,21 @@ struct Window {
 }
 
 impl Shell for Linux {
+    fn verify_smoke_render(&self) {
+        let view = self.app.view();
+        if let Some(window) = self.window.borrow().as_ref() {
+            let selected = window
+                .profiles
+                .selected_item()
+                .and_downcast::<gtk::StringObject>()
+                .map(|s| s.string().to_string());
+            assert_eq!(
+                selected.as_ref(),
+                view.profile_index.map(|i| &view.profiles[i])
+            );
+            assert_eq!(window.stats.text(), view.stats);
+        }
+    }
     fn render(&self) {
         let view = self.app.view();
         self.update_tray(&view);
@@ -156,9 +171,9 @@ impl Shell for Linux {
         self.rendering.set(false);
     }
     fn show_settings(&self) {
+        self.app.load_summary();
         if self.window.borrow().is_none() {
             let window = self.make_window();
-            self.app.load_summary();
             *self.window.borrow_mut() = Some(window);
         }
         self.render();
@@ -370,6 +385,16 @@ impl Linux {
             .title("FlowBar")
             .resizable(false)
             .build();
+        native.connect_is_active_notify(|window| {
+            if window.is_active() {
+                with_shell(|shell| {
+                    if !shell.rendering.get() {
+                        shell.app.load_summary();
+                        shell.render();
+                    }
+                });
+            }
+        });
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.set_margin_top(14);
         content.set_margin_bottom(16);
@@ -673,9 +698,10 @@ fn menu_items(entries: &[Entry]) -> Vec<ksni::MenuItem<Tray>> {
                 enabled,
                 checked,
             } => {
-                // Hosts show the text after a tab at the right edge, or at least set apart.
+                // D-Bus menu hosts disagree about tab stops. Keep the complete result in
+                // the label so a panel cannot interpret it as a clipped accelerator.
                 let label = match detail {
-                    Some(detail) => format!("{}\t{detail}", menu_label(title)),
+                    Some(detail) => format!("{}    {detail}", menu_label(title)),
                     None => menu_label(title),
                 };
                 let action = action.clone();

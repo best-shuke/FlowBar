@@ -1,0 +1,53 @@
+name: Build pinned rill core
+description: Build the fixed core with XPro and verify the native binary before packaging
+inputs:
+  revision:
+    description: Exact rill source commit
+    required: true
+  target:
+    description: Core target triple
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v5
+      with:
+        repository: best-shuke/rill
+        ref: ${{ inputs.revision }}
+        path: .rill
+    - name: Install pinned Rust
+      shell: bash
+      run: |
+        set -euo pipefail
+        tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' .rill/rust-toolchain.toml | head -n1)
+        test -n "$tc"
+        version=$(sed -n 's/^version = "\(.*\)"$/\1/p' .rill/Cargo.toml | head -n1)
+        test "$version" = "${RILL_VERSION#v}"
+        if ! command -v rustup >/dev/null; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+        rustup toolchain install "$tc" --profile minimal --component clippy,rustfmt --no-self-update
+        rustup target add --toolchain "$tc" "${{ inputs.target }}"
+        echo "RUSTUP_TOOLCHAIN=$tc" >> "$GITHUB_ENV"
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: |
+          . -> target
+          .rill -> target
+        key: core-${{ inputs.target }}
+        cache-on-failure: true
+    - name: Install Zig
+      if: contains(inputs.target, 'linux-musl')
+      uses: mlugg/setup-zig@v1
+      with:
+        version: 0.13.0
+    - name: Install cargo-zigbuild
+      if: contains(inputs.target, 'linux-musl')
+      shell: bash
+      run: cargo install --locked cargo-zigbuild
+    - name: Build and verify core
+      shell: bash
+      run: |
+        ./scripts/build-core.sh "$GITHUB_WORKSPACE/.rill" "$RUNNER_TEMP/rill" "${{ inputs.target }}"

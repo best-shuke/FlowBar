@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,8 +12,8 @@ concurrency:
   group: release-${{ github.ref }}
 
 env:
-  # The bundled core: a rill release (https://github.com/best-shuke/rill/releases).
-  RILL_VERSION: v0.1.4
+  RILL_VERSION: v0.1.5
+  RILL_REVISION: b781566560480bb4e826fc9200d965c333612421
 
 jobs:
   build:
@@ -24,29 +25,24 @@ jobs:
             system: macos
             arch: arm64
             target_core: aarch64-apple-darwin
-            sha256: 840683df45bb135d51eb5e34589e57e399c16a78cd360fd62413d86cdfc97abf
           - os: ubuntu-22.04
             system: linux
             arch: x86_64
             target_core: x86_64-unknown-linux-musl
-            sha256: 3e80869d9cf04df17529a954d811442e09cf322501d673e6e1c772b68cf5028e
           - os: ubuntu-22.04-arm
             system: linux
             arch: arm64
             target_core: aarch64-unknown-linux-musl
-            sha256: 4b734f0554520a30eda70ae971b6e60a7692adb98a7e4e1774e8b23a1bd3014d
           - os: windows-2022
             system: windows
             arch: x86_64
             target_core: x86_64-pc-windows-msvc
-            sha256: 529c5c9c0ac1b4b91286b663953ce9febc74631754ae176b16ca589af8130e1a
           # Cross-built: the x64 runner has the ARM64 MSVC tools.
           - os: windows-2022
             system: windows
             arch: arm64
             target: aarch64-pc-windows-msvc
             target_core: aarch64-pc-windows-msvc
-            sha256: 6712fd76dc42f0cfbc24bf2aa9ae6be8ca9f0bd4373836e25176fb4829c9aa25
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -59,8 +55,9 @@ jobs:
 
       - name: Check version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
           CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          VERSION="$CARGO_VERSION"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then VERSION="${GITHUB_REF_NAME#v}"; fi
           PLIST_VERSION="$(sed -n 's/.*<key>CFBundleShortVersionString<\/key><string>\(.*\)<\/string>.*/\1/p' Resources/Info.plist)"
           if [ "$VERSION" != "$CARGO_VERSION" ] || [ "$VERSION" != "$PLIST_VERSION" ]; then
             echo "::error::Tag $GITHUB_REF_NAME, Cargo.toml $CARGO_VERSION and Info.plist $PLIST_VERSION must match."
@@ -68,25 +65,16 @@ jobs:
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
-      - name: Install Rust
-        run: |
-          if ! command -v rustup >/dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-            export PATH="$HOME/.cargo/bin:$PATH"
-          fi
-          if [ -n "${{ matrix.target }}" ]; then
-            rustup target add ${{ matrix.target }}
-          fi
-
       - name: Install Linux dependencies
         if: matrix.system == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev
+          sudo apt-get install -y libgtk-4-dev xvfb dbus python3-gi
 
-      - name: Fetch rill
-        run: ./scripts/fetch-rill.sh "$RILL_VERSION" ${{ matrix.target_core }} ${{ matrix.sha256 }} "$(dirname "$CORE")"
+      - uses: ./.github/actions/build-core
+        with:
+          revision: ${{ env.RILL_REVISION }}
+          target: ${{ matrix.target_core }}
 
       - name: Fetch Geo databases
         run: ./scripts/fetch-geo.sh "$RUNNER_TEMP/geo"
@@ -121,6 +109,16 @@ jobs:
               mv "dist/$ASSET-setup.exe" . ;;
           esac
 
+      - name: Native UI smoke test
+        if: matrix.target == ''
+        run: |
+          case ${{ matrix.system }} in
+            linux)
+              xvfb-run -a dbus-run-session -- python3 scripts/ui-smoke-test.py
+              xvfb-run -a dbus-run-session -- python3 scripts/tray-smoke-test.py ;;
+            *) python3 scripts/ui-smoke-test.py ;;
+          esac
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.system }}-${{ matrix.arch }}
@@ -145,9 +143,11 @@ jobs:
         run: |
           cp scripts/install.sh scripts/install.ps1 assets/
           DOWNLOAD="https://github.com/$GITHUB_REPOSITORY/releases/latest/download"
+          VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          TAG="v$VERSION"
           NOTES_FILE="$RUNNER_TEMP/flowbar-release-notes.md"
-          if [ -f "docs/releases/${GITHUB_REF_NAME#v}.md" ]; then
-            cat "docs/releases/${GITHUB_REF_NAME#v}.md" > "$NOTES_FILE"
+          if [ -f "docs/releases/$VERSION.md" ]; then
+            cat "docs/releases/$VERSION.md" > "$NOTES_FILE"
           else
             : > "$NOTES_FILE"
           fi
@@ -155,11 +155,14 @@ jobs:
 
           macOS / Linux 在终端运行 \`curl -fsSL $DOWNLOAD/install.sh | sh\`；Windows 下载 \`setup.exe\` 双击安装，或在 PowerShell 运行 \`irm $DOWNLOAD/install.ps1 | iex\`。
 
-          内置 rill $RILL_VERSION（MIT，https://github.com/best-shuke/rill/releases/tag/$RILL_VERSION）。
+          内置 rill $RILL_VERSION，启用 XPro（MIT，固定源码提交 https://github.com/best-shuke/rill/commit/$RILL_REVISION）。
           内置的 geoip.metadb 和 GeoSite.dat 取自构建当天的 MetaCubeX/meta-rules-dat（GPL-3.0，https://github.com/MetaCubeX/meta-rules-dat）。
           EOF
-          gh release create "$GITHUB_REF_NAME" assets/* \
+          DRAFT=()
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then DRAFT=(--draft); fi
+          gh release create "$TAG" assets/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "FlowBar ${GITHUB_REF_NAME#v}" \
+            --target "$GITHUB_SHA" \
+            --title "FlowBar $VERSION" \
             --notes-file "$NOTES_FILE" \
-            --generate-notes
+            --generate-notes "${DRAFT[@]}"
