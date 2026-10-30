@@ -586,7 +586,7 @@ mod validation_tests {
         assert!(run.core_ended());
         #[cfg(unix)]
         {
-            let mut child = Command::new("/bin/true").spawn().unwrap();
+            let mut child = Command::new("/usr/bin/true").spawn().unwrap();
             let pid = child.id();
             child.wait().unwrap();
             supervisor::status(session.path(), "running", Some(pid), parent).unwrap();
