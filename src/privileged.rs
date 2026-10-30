@@ -342,6 +342,10 @@ pub fn serve(uid: u32) -> Result<()> {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     let identity = digest(&std::env::current_exe()?)?;
     for mut stream in listener.incoming().flatten() {
+        // Each Start leaves a detached supervisor that outlives its request, and this service
+        // never exits, so reap the ones that have ended before they pile up as zombies. No
+        // other child of this process runs between requests.
+        while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
         let result = (|| -> Result<()> {
             stream.set_read_timeout(Some(Duration::from_secs(5)))?;
             stream.set_write_timeout(Some(Duration::from_secs(5)))?;
