@@ -160,10 +160,25 @@ jobs:
           内置的 geoip.metadb 和 GeoSite.dat 取自构建当天的 MetaCubeX/meta-rules-dat（GPL-3.0，https://github.com/MetaCubeX/meta-rules-dat）。
           EOF
           DRAFT=()
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then DRAFT=(--draft); fi
-          gh release create "$TAG" assets/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "FlowBar $VERSION" \
-            --notes-file "$NOTES_FILE" \
-            --generate-notes "${DRAFT[@]}"
+          IS_DRAFT=false
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            DRAFT=(--draft)
+            IS_DRAFT=true
+          fi
+          if EXISTING_DRAFT=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft); then
+            if [ "$EXISTING_DRAFT" != true ]; then
+              echo "::error::Release $TAG is already published."
+              exit 1
+            fi
+            gh release upload "$TAG" assets/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "FlowBar $VERSION" \
+              --notes-file "$NOTES_FILE" --draft="$IS_DRAFT"
+          else
+            gh release create "$TAG" assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "FlowBar $VERSION" \
+              --notes-file "$NOTES_FILE" \
+              --generate-notes "${DRAFT[@]}"
+          fi

@@ -25,7 +25,11 @@ try:
     with socket.socket(socket.AF_UNIX) as client:
         client.settimeout(10)
         client.connect(str(base / 'helper.sock'))
-        response = json.loads(client.recv(65536))
+        # Unix stream sockets may split even a short JSON response across reads.
+        with client.makefile('rb') as reader:
+            line = reader.readline(65537)
+        assert line.endswith(b'\n') and len(line) <= 65536, 'Incomplete or oversized helper response'
+        response = json.loads(line)
         assert response['error'], 'Helper must reject a Python client with the same UID'
     print('PASS same-user unsigned/unrelated client rejected; helper reused across application launches')
 except Exception:
