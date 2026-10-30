@@ -1357,7 +1357,9 @@ pub fn login_status() -> Login {
             &mut size,
         )
     };
-    let value = String::from_utf16_lossy(&buffer[..(size as usize / 2).saturating_sub(1)]);
+    // A value too large for the buffer fails, and `size` is then the size it needs.
+    let length = (size as usize / 2).saturating_sub(1).min(buffer.len());
+    let value = String::from_utf16_lossy(&buffer[..length]);
     // An entry for a FlowBar elsewhere would start that copy, so it does not count.
     if status == 0 && command_line().is_some_and(|ours| ours.eq_ignore_ascii_case(&value)) {
         Login::Enabled

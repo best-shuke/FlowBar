@@ -870,19 +870,23 @@ impl App {
             let mut name = config::profile_name(&stem);
             // Profile names are file names, which may ignore case.
             let profiles = self.ui.borrow().profiles.clone();
-            let taken = |name: &str| {
+            let existing = |name: &str| {
                 profiles
                     .iter()
-                    .any(|p| p.to_lowercase() == name.to_lowercase())
+                    .find(|p| p.to_lowercase() == name.to_lowercase())
+                    .cloned()
             };
-            if taken(&name) {
+            let taken = |name: &str| existing(name).is_some();
+            if let Some(current) = existing(&name) {
                 let choice = shell.alert(
-                    &format!("已有名为「{name}」的配置"),
+                    &format!("已有名为「{current}」的配置"),
                     "订阅更新后可以替换它；导入另一个同名文件时，可以另存为新配置。",
                     &["替换", "另存为新配置", "取消"],
                 );
                 match choice {
-                    0 => {}
+                    // Replace the existing copy under its own spelling, or a case-sensitive
+                    // file system would keep both and others would show the old name.
+                    0 => name = current,
                     1 => {
                         name = (2..)
                             .map(|number| format!("{name} {number}"))

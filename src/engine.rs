@@ -84,6 +84,14 @@ impl Run {
                 || supervisor::running(&supervisor::tun_session(&stage, id))
         });
     }
+    /// Whether the core has stopped. A supervisor that was killed never reports it, and on
+    /// Unix its PID check works even for a root core; Linux ends the core with its supervisor.
+    fn core_ended(&self) -> bool {
+        supervisor::read_status(&self.status_path).is_some_and(|status| {
+            status.state != "running"
+                || (cfg!(unix) && status.core_pid.is_some_and(|pid| !process::alive(pid)))
+        })
+    }
     pub fn group_order(&self) -> Vec<String> {
         fs::read_to_string(config::profile_path(&self.settings.profile_name))
             .ok()
@@ -336,7 +344,7 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
         if run.cancelled.load(Ordering::SeqCst) {
             let deadline = Instant::now() + Duration::from_secs(8);
             loop {
-                if supervisor::read_status(&run.status_path).is_some_and(|s| s.state != "running") {
+                if run.core_ended() {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
@@ -345,7 +353,7 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
                 thread::sleep(Duration::from_millis(100));
             }
         }
-        if supervisor::read_status(&run.status_path).is_some_and(|s| s.state != "running") {
+        if run.core_ended() {
             bail!("内核已退出，请查看运行日志。");
         }
         if let Some(helper) = helper.as_mut() {
@@ -554,6 +562,37 @@ fn verge_running() -> Result<bool> {
 #[cfg(test)]
 mod validation_tests {
     use super::*;
+
+    #[test]
+    fn a_core_that_died_without_its_supervisor_counts_as_ended() {
+        let session = tempfile::tempdir().unwrap();
+        let run = Run {
+            id: Uuid::new_v4().to_string(),
+            settings: Settings::default(),
+            api: Api {
+                port: 0,
+                secret: String::new(),
+            },
+            stage: session.path().into(),
+            status_path: session.path().into(),
+            cancelled: AtomicBool::new(false),
+            command_pid: AtomicU32::new(0),
+        };
+        assert!(!run.core_ended());
+        let parent = std::process::id();
+        supervisor::status(session.path(), "running", Some(parent), parent).unwrap();
+        assert!(!run.core_ended());
+        supervisor::status(session.path(), "stopped", None, parent).unwrap();
+        assert!(run.core_ended());
+        #[cfg(unix)]
+        {
+            let mut child = Command::new("/bin/true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            supervisor::status(session.path(), "running", Some(pid), parent).unwrap();
+            assert!(run.core_ended());
+        }
+    }
 
     #[test]
     fn reports_downloads_and_distinguishes_geo_errors_from_other_config_errors() {

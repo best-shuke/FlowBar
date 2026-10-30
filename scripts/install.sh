@@ -26,7 +26,8 @@ quit_running() {
 
 # Escapes a path for the Exec key of a desktop entry, quoted.
 desktop_exec() {
-    printf '"%s"' "$(printf '%s' "$1" | sed -e 's/[\\"`$]/\\\\&/g' -e 's/%/%%/g')"
+    # A backslash carries two levels of escaping, so it becomes four.
+    printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\\\\\/g' -e 's/["`$]/\\\\&/g' -e 's/%/%%/g')"
 }
 
 main() {
