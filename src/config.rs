@@ -498,6 +498,30 @@ fn rule_target(rule: &str) -> Option<(String, String)> {
     Some((kind, (*target).to_owned()))
 }
 
+/// Retain an exact destination IP rule when its dedicated policy disappeared.
+/// Do not redirect source-IP rules or whole subnets to a different policy.
+fn ip_rule_fallback(rule: &str) -> Option<String> {
+    let mut fields = rule.splitn(4, ',').map(str::trim);
+    let kind = fields.next()?;
+    let payload = fields.next()?;
+    let _target = fields.next()?;
+    let options = fields.next();
+    if options.is_some_and(|options| options.split(',').any(|s| s.trim() == "src")) {
+        return None;
+    }
+    let (address, prefix) = payload.split_once('/')?;
+    let address = address.parse::<std::net::IpAddr>().ok()?;
+    let host = matches!(
+        (kind.to_ascii_uppercase().as_str(), address, prefix),
+        ("IP-CIDR", std::net::IpAddr::V4(_), "32")
+            | ("IP-CIDR" | "IP-CIDR6", std::net::IpAddr::V6(_), "128")
+    );
+    host.then(|| match options {
+        Some(options) => format!("{kind},{payload},proxy,{options}"),
+        None => format!("{kind},{payload},proxy"),
+    })
+}
+
 /// Makes a profile whose nodes were edited or deleted load again, without touching the
 /// imported copy. mihomo refuses a whole config over one unknown proxy type, one group member
 /// or rule target that no longer exists, or one group left without members. FlowBar drops
@@ -524,6 +548,26 @@ fn repair(map: &mut Mapping) -> Vec<String> {
             ));
         }
         proxies.extend(list.iter().filter_map(|proxy| name_of(&proxy["name"])));
+        // rill accepted Xray's Mux.Cool here, but mihomo's smux is sing-mux and
+        // rejects it while loading the node. VLESS/VMess also work without this
+        // optional layer. Do not substitute smux/h2mux: the server speaks a
+        // different wire protocol. Leave supported multiplexers untouched.
+        let mut without_mux = vec![];
+        for proxy in list.iter_mut() {
+            let xray = matches!(proxy["type"].as_str(), Some("vless" | "vmess"));
+            let muxcool = proxy["smux"]["protocol"].as_str() == Some("muxcool");
+            if xray && muxcool {
+                without_mux.push(name_of(&proxy["name"]).unwrap_or_else(|| "未命名".into()));
+                proxy.as_mapping_mut().unwrap().remove("smux");
+            }
+        }
+        if !without_mux.is_empty() {
+            notes.push(format!(
+                "已关闭 {} 个节点上 mihomo 不支持的 Mux.Cool 多路复用，保留普通 VLESS/VMess 连接：{}",
+                without_mux.len(),
+                listed(&without_mux)
+            ));
+        }
     }
     let mut dangling = 0;
     let mut touched = std::collections::BTreeSet::new();
@@ -602,7 +646,8 @@ fn repair(map: &mut Mapping) -> Vec<String> {
         .filter_map(|(name, _)| name_of(name))
         .collect();
     let mut dropped = 0;
-    let mut keep = |rule: &Value| {
+    let mut fallback = 0;
+    let mut keep = |rule: &mut Value| {
         let Some((kind, target)) = rule.as_str().and_then(rule_target) else {
             return true;
         };
@@ -612,29 +657,41 @@ fn repair(map: &mut Mapping) -> Vec<String> {
             known.contains(&target)
         };
         if !valid {
+            if known.contains("proxy") {
+                if let Some(replacement) = rule.as_str().and_then(ip_rule_fallback) {
+                    *rule = Value::String(replacement);
+                    fallback += 1;
+                    return true;
+                }
+            }
             dropped += 1;
         }
         valid
     };
     if let Some(rules) = map.get_mut("rules").and_then(Value::as_sequence_mut) {
-        rules.retain(&mut keep);
+        rules.retain_mut(&mut keep);
     }
     if let Some(subs) = map.get_mut("sub-rules").and_then(Value::as_mapping_mut) {
         for (_, rules) in subs.iter_mut() {
             if let Some(rules) = rules.as_sequence_mut() {
-                rules.retain(&mut keep);
+                rules.retain_mut(&mut keep);
             }
         }
     }
     if dropped > 0 {
         notes.push(format!("已跳过 {dropped} 条指向不存在节点或策略组的规则"));
     }
+    if fallback > 0 {
+        notes.push(format!(
+            "已将 {fallback} 条对应节点或策略组不存在的服务器 IP 规则改为使用 proxy"
+        ));
+    }
     notes
 }
 
-/// Connections to a proxy server go out directly. A TUN captures every route, and whatever
-/// reaches one of these addresses through it, such as a dial that missed the physical
-/// interface, would otherwise be sent to a proxy again and loop until it times out.
+/// Connections to a proxy endpoint go out directly if a dial misses the physical
+/// interface. Match its port as well: bypassing the whole IP would also force unrelated
+/// services (such as SSH on the same machine) to go direct instead of following the profile.
 fn bypass_proxy_servers(map: &mut Mapping) {
     let mut seen = std::collections::HashSet::new();
     let bypass: Vec<Value> = map
@@ -644,15 +701,39 @@ fn bypass_proxy_servers(map: &mut Mapping) {
         .flatten()
         // A server behind dialer-proxy is reached through another node, never directly.
         .filter(|proxy| proxy.get("dialer-proxy").is_none())
-        .filter_map(|proxy| proxy["server"].as_str())
-        .map(|server| server.trim().trim_start_matches('[').trim_end_matches(']'))
-        .filter(|server| !server.is_empty() && !server.contains(','))
-        .filter(|server| seen.insert(server.to_ascii_lowercase()))
-        .map(|server| match server.parse::<std::net::IpAddr>() {
-            Ok(std::net::IpAddr::V4(ip)) => format!("IP-CIDR,{ip}/32,DIRECT,no-resolve"),
-            Ok(std::net::IpAddr::V6(ip)) => format!("IP-CIDR6,{ip}/128,DIRECT,no-resolve"),
-            Err(_) => format!("DOMAIN,{server},DIRECT"),
+        .filter_map(|proxy| {
+            let server = proxy["server"]
+                .as_str()?
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            if server.is_empty() || server.contains([',', '(', ')']) {
+                return None;
+            }
+            // Hysteria port hopping overrides `port`. DST-PORT uses `/` between
+            // ranges, whereas the outbound's `ports` field uses commas.
+            let ports = name_of(proxy.get("ports").unwrap_or(&proxy["port"]))?;
+            let ports = ports.replace(',', "/");
+            let valid = ports.split('/').all(|range| {
+                let mut bounds = range.split('-');
+                let port = |s: &str| s.parse::<u16>().ok().filter(|p| *p > 0);
+                let Some(start) = bounds.next().and_then(port) else {
+                    return false;
+                };
+                let end = bounds.next().map(port).unwrap_or(Some(start));
+                end.is_some_and(|end| end >= start) && bounds.next().is_none()
+            });
+            if !valid {
+                return None;
+            }
+            let host = match server.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(ip)) => format!("IP-CIDR,{ip}/32,no-resolve"),
+                Ok(std::net::IpAddr::V6(ip)) => format!("IP-CIDR6,{ip}/128,no-resolve"),
+                Err(_) => format!("DOMAIN,{server}"),
+            };
+            Some(format!("AND,(({host}),(DST-PORT,{ports})),DIRECT"))
         })
+        .filter(|rule| seen.insert(rule.to_ascii_lowercase()))
         .map(Value::from)
         .collect();
     if bypass.is_empty() {
@@ -894,8 +975,100 @@ mod tests {
         assert!(intact.notes.is_empty());
     }
     #[test]
+    fn missing_server_policy_falls_back_to_proxy_without_changing_other_rules() {
+        let yaml = "proxies:\n  - {name: node, type: ss, server: 203.0.113.9, port: 443}\n  - {name: old, type: xpro, server: 203.0.113.10, port: 443}\nproxy-groups:\n  - {name: proxy, type: select, proxies: [node]}\n  - {name: dedicated, type: select, proxies: [old]}\nsub-rules:\n  internal: ['IP-CIDR,192.0.2.2/32,deleted,no-resolve']\nrules:\n  - IP-CIDR,203.0.113.9/32,node,no-resolve\n  - IP-CIDR,203.0.113.10/32,old,no-resolve\n  - IP-CIDR,203.0.113.11/32,dedicated\n  - IP-CIDR6,2001:db8::1/128,deleted,no-resolve\n  - IP-CIDR,192.0.2.1/32,DIRECT,no-resolve\n  - IP-CIDR,198.51.100.0/24,deleted,no-resolve\n  - IP-CIDR,198.51.100.1/32,deleted,src,no-resolve\n  - DOMAIN,example.com,deleted\n  - MATCH,proxy\n";
+        for tun in [false, true] {
+            let output = render(
+                yaml,
+                &Settings {
+                    tun,
+                    ..Settings::default()
+                },
+                "secret",
+            )
+            .unwrap();
+            let root = parse(&output.yaml).unwrap();
+            let rules: Vec<_> = root["rules"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|rule| !rule.starts_with("AND,"))
+                .collect();
+            assert_eq!(
+                rules,
+                [
+                    "IP-CIDR,203.0.113.9/32,node,no-resolve",
+                    "IP-CIDR,203.0.113.10/32,proxy,no-resolve",
+                    "IP-CIDR,203.0.113.11/32,proxy",
+                    "IP-CIDR6,2001:db8::1/128,proxy,no-resolve",
+                    "IP-CIDR,192.0.2.1/32,DIRECT,no-resolve",
+                    "MATCH,proxy",
+                ]
+            );
+            assert_eq!(
+                root["sub-rules"]["internal"][0].as_str(),
+                Some("IP-CIDR,192.0.2.2/32,proxy,no-resolve")
+            );
+            assert!(
+                output
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("4 条") && note.contains("proxy"))
+            );
+        }
+        // Without a surviving proxy policy, do not invent a dangling fallback.
+        let without_proxy = yaml
+            .replace("name: proxy,", "name: other,")
+            .replace("MATCH,proxy", "MATCH,other");
+        let root =
+            parse(&runtime(&without_proxy, &Settings::default(), "secret").unwrap()).unwrap();
+        assert!(
+            root["rules"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .all(|rule| !rule.as_str().unwrap().contains(",proxy"))
+        );
+        assert!(
+            root["sub-rules"]["internal"]
+                .as_sequence()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn muxcool_keeps_the_node_and_supported_multiplexers_stay_intact() {
+        let yaml = "proxies:\n  - {name: cf, type: vless, server: cf.example.com, uuid: keep, network: ws, ws-opts: {path: /keep}, smux: {enabled: true, protocol: muxcool}}\n  - {name: vm, type: vmess, smux: {enabled: true, protocol: muxcool}}\n  - {name: off, type: vless, smux: {enabled: false, protocol: muxcool}}\n  - {name: sing, type: vless, smux: {enabled: true, protocol: smux, padding: true}}\n  - {name: future, type: vless, smux: {enabled: true, protocol: unknown}}\nproxy-groups:\n  - {name: proxy, type: select, proxies: [cf, vm, off, sing, future]}\nrules: ['MATCH,proxy']\n";
+        let original = parse(yaml).unwrap();
+        for tun in [false, true] {
+            let result = render(
+                yaml,
+                &Settings {
+                    tun,
+                    ..Settings::default()
+                },
+                "secret",
+            )
+            .unwrap();
+            let root = parse(&result.yaml).unwrap();
+            assert_eq!(root["proxies"].as_sequence().unwrap().len(), 5);
+            for index in 0..3 {
+                let mut expected = original["proxies"][index].clone();
+                expected.as_mapping_mut().unwrap().remove("smux");
+                assert_eq!(root["proxies"][index], expected);
+            }
+            for index in 3..5 {
+                assert_eq!(root["proxies"][index], original["proxies"][index]);
+            }
+            assert_eq!(root["proxy-groups"], original["proxy-groups"]);
+            assert_eq!(result.notes.len(), 1);
+            assert!(result.notes[0].contains("Mux.Cool"));
+        }
+    }
+    #[test]
     fn tun_sends_proxy_servers_direct_and_follows_the_live_interface() {
-        let yaml = "interface-name: en0\nlog-level: warning\nproxies:\n  - {name: a, type: ss, server: a.example.com}\n  - {name: b, type: ss, server: 203.0.113.7}\n  - {name: c, type: ss, server: '2001:db8::1'}\n  - {name: d, type: ss, server: A.example.com}\n  - {name: e, type: ss, server: inner.example.com, dialer-proxy: a}\nrules: ['MATCH,a']\n";
+        let yaml = "interface-name: en0\nlog-level: warning\nproxies:\n  - {name: a, type: ss, server: a.example.com, port: 443}\n  - {name: b, type: ss, server: 203.0.113.7, port: 443}\n  - {name: c, type: ss, server: '2001:db8::1', port: 443}\n  - {name: d, type: ss, server: A.example.com, port: 443}\n  - {name: e, type: ss, server: inner.example.com, port: 443, dialer-proxy: a}\n  - {name: hop, type: hysteria2, server: 203.0.113.7, port: 443, ports: '8443,9000-9010'}\n  - {name: bad, type: ss, server: invalid.example.com, port: 0}\nrules: ['MATCH,a']\n";
         let root = parse(&runtime(yaml, &Settings::default(), "secret").unwrap()).unwrap();
         let rules: Vec<_> = root["rules"]
             .as_sequence()
@@ -906,9 +1079,10 @@ mod tests {
         assert_eq!(
             rules,
             [
-                "DOMAIN,a.example.com,DIRECT",
-                "IP-CIDR,203.0.113.7/32,DIRECT,no-resolve",
-                "IP-CIDR6,2001:db8::1/128,DIRECT,no-resolve",
+                "AND,((DOMAIN,a.example.com),(DST-PORT,443)),DIRECT",
+                "AND,((IP-CIDR,203.0.113.7/32,no-resolve),(DST-PORT,443)),DIRECT",
+                "AND,((IP-CIDR6,2001:db8::1/128,no-resolve),(DST-PORT,443)),DIRECT",
+                "AND,((IP-CIDR,203.0.113.7/32,no-resolve),(DST-PORT,8443/9000-9010)),DIRECT",
                 "MATCH,a"
             ]
         );

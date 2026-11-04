@@ -112,6 +112,10 @@ jobs:
             windows) pwsh -File scripts/build-windows.ps1 -Core "$CORE" -Target "${{ matrix.target }}" -Geo "$RUNNER_TEMP/geo" ;;
           esac
 
+      - name: Core smoke test
+        if: matrix.target == ''
+        run: python3 scripts/smoke-test.py
+
       - name: Package
         run: |
           ASSET="FlowBar-$VERSION-${{ matrix.system }}-${{ matrix.arch }}"

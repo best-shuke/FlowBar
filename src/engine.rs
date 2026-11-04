@@ -203,7 +203,7 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
     if !notes.is_empty() {
         emit(Event::Progress(
             run.id.clone(),
-            "配置中有已删除或内核不支持的节点，已自动跳过，正在检查配置…".into(),
+            "已处理配置兼容性问题，正在检查配置…".into(),
         ));
     }
     let config_file = run.stage.join("config.yaml");

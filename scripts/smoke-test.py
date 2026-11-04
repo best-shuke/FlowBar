@@ -93,6 +93,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
 with tempfile.TemporaryDirectory(prefix='flowbar-smoke-') as temp:
     temp = Path(temp)
     os.chmod(temp, 0o700)
+    # A rill/Xray profile must keep its VLESS node when mihomo cannot use
+    # Mux.Cool. Check against the real core, not just the rendered YAML.
+    muxcool = temp / 'muxcool.yaml'
+    muxcool.write_text('''proxies:
+  - name: legacy-vless
+    type: vless
+    server: 127.0.0.1
+    port: 9
+    uuid: 00000000-0000-0000-0000-000000000001
+    network: ws
+    smux: {enabled: true, protocol: muxcool}
+proxy-groups:
+  - {name: proxy, type: select, proxies: [legacy-vless]}
+rules: ['MATCH,proxy']
+''', encoding='utf-8')
+    rejected = subprocess.run([str(CORE), '-t', '-d', str(temp), '-f', str(muxcool)],
+                              capture_output=True, timeout=20)
+    assert rejected.returncode != 0 and b'unknown protocol: muxcool' in rejected.stdout + rejected.stderr
+    compatible = temp / 'muxcool-runtime.yaml'
+    render(muxcool, compatible)
+    validate(compatible, temp)
+    assert 'legacy-vless' in compatible.read_text(encoding='utf-8')
+    print('PASS Mux.Cool profile: original reproduces the error, rendered VLESS node accepted by mihomo')
     # The active imported profile; FlowBar 0.5 and earlier kept a single profile.yaml.
     try:
         name = json.loads((HOME / 'settings.json').read_text(encoding='utf-8'))['profileName']
@@ -170,5 +193,56 @@ rules:
             process.terminate()
             process.wait(timeout=8)
             server.shutdown()
+
+    # Exercise the generated TUN bypass rules without activating TUN. Two
+    # services share an IP; only the proxy endpoint may bypass the server rule.
+    # A missing dedicated node must fall back to the proxy selector, before MATCH.
+    endpoint = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    unrelated = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    for server in (endpoint, unrelated):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    fixture.write_text(f'''proxies:
+  - {{name: endpoint, type: ss, server: 127.0.0.1, port: {endpoint.server_port}, cipher: aes-128-gcm, password: test}}
+proxy-groups:
+  - {{name: proxy, type: select, proxies: [REJECT, DIRECT]}}
+rules: ['IP-CIDR,127.0.0.1/32,deleted-node,no-resolve', 'MATCH,DIRECT']
+''', encoding='utf-8')
+    render(fixture, runtime, tun=True)
+    # Keep the rendered rules, but turn off TUN and its DNS listener.
+    runtime.write_text(runtime.read_text(encoding='utf-8').replace('  enable: true\n', '  enable: false\n'),
+                       encoding='utf-8')
+    validate(runtime, temp)
+    with (temp / 'endpoint-core.log').open('wb') as log:
+        process = launch(runtime, temp, log)
+        try:
+            assert api('/configs')[1]['tun']['enable'] is False
+            for server, allowed in [(endpoint, True), (unrelated, False)]:
+                conn = http.client.HTTPConnection('127.0.0.1', PROXY_PORT, timeout=3)
+                conn.request('GET', f'http://127.0.0.1:{server.server_port}/probe')
+                try:
+                    response = conn.getresponse()
+                    payload = response.read()
+                    if allowed:
+                        assert response.status == 200 and payload == b'flowbar-direct-ok'
+                    else:
+                        assert response.status >= 400
+                except (ConnectionResetError, http.client.RemoteDisconnected):
+                    assert not allowed
+                finally:
+                    conn.close()
+            assert api('/proxies/proxy')[1]['now'] == 'REJECT'
+            assert api('/proxies/proxy', 'PUT', {'name': 'DIRECT'})[0] == 204
+            conn = http.client.HTTPConnection('127.0.0.1', PROXY_PORT, timeout=3)
+            conn.request('GET', f'http://127.0.0.1:{unrelated.server_port}/probe')
+            response = conn.getresponse()
+            assert response.status == 200 and response.read() == b'flowbar-direct-ok'
+            conn.close()
+            print('PASS server IP routing: endpoint bypasses, missing dedicated node follows proxy selection (REJECT then DIRECT)')
+        finally:
+            process.terminate()
+            process.wait(timeout=8)
+            for server in (endpoint, unrelated):
+                server.shutdown()
+                server.server_close()
 
 print('All integration checks passed; system proxy, DNS and TUN were not changed.')

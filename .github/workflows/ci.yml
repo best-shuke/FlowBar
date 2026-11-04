@@ -74,6 +74,9 @@ jobs:
             windows) pwsh -File scripts/build-windows.ps1 -Core "$CORE" -Geo "$RUNNER_TEMP/geo" ;;
           esac
 
+      - name: Core smoke test
+        run: python3 scripts/smoke-test.py
+
       # The packaged app, for trying a change on a real Mac before it is released. ditto keeps
       # the bundle's permissions and signatures, which the artifact upload alone would not.
       - name: Keep the macOS app
