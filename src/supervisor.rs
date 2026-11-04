@@ -23,15 +23,15 @@ use std::{
 use uuid::Uuid;
 
 #[cfg(windows)]
-pub const CORE: &str = "rill.exe";
+pub const CORE: &str = "mihomo.exe";
 #[cfg(not(windows))]
-pub const CORE: &str = "rill";
-/// The core FlowBar 0.4 and earlier ran. A session one of them started can outlive the
-/// update, so its core still counts as one.
+pub const CORE: &str = "mihomo";
+/// The core FlowBar 0.5 to 0.8 ran. A session one of them started can outlive the update,
+/// so its core still counts as one.
 #[cfg(windows)]
-const LEGACY_CORE: &str = "mihomo.exe";
+pub(crate) const LEGACY_CORE: &str = "rill.exe";
 #[cfg(not(windows))]
-const LEGACY_CORE: &str = "mihomo";
+pub(crate) const LEGACY_CORE: &str = "rill";
 /// Root-owned TUN sessions and their data cache, one directory per user ID.
 #[cfg(target_os = "macos")]
 const ROOT_BASE: &str = "/Library/Application Support/FlowBar";
@@ -114,7 +114,7 @@ fn is_core(pid: u32) -> bool {
     }
 }
 /// Whether a process runs the core copy in a root session directory, which only root writes.
-/// A PID that a reboot gave to another program, even another rill, never matches.
+/// A PID that a reboot gave to another program, even another mihomo, never matches.
 #[cfg(unix)]
 fn runs_session_core(pid: u32, session: &Path) -> bool {
     let Ok(running) = executable(pid).and_then(fs::metadata) else {
@@ -511,6 +511,7 @@ fn run_core(
         ])
         .current_dir(cache)
         .env("HOME", home)
+        .env("GOGC", "50")
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log.try_clone()?));
     #[cfg(target_os = "macos")]

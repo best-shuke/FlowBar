@@ -1,19 +1,17 @@
-FlowBar is a Rust native controller for the rill proxy core: AppKit and ServiceManagement on
-macOS, Win32 on Windows, and GTK 4 with a StatusNotifierItem on Linux. It starts rill as a
+FlowBar is a Rust native controller for mihomo: AppKit and ServiceManagement on macOS,
+Win32 on Windows, and GTK 4 with a StatusNotifierItem on Linux. It starts mihomo as a
 separate process. No Swift code or WebView is used by this build.
 
-rill: https://github.com/best-shuke/rill (MIT), a Rust proxy core that reads mihomo
-configurations, derived from meow-rs (https://github.com/meow-rs/meow-rs, MIT).
-Release builds compile a pinned rill source commit with the XPro feature enabled;
-the release notes name its version and commit, also saved in CORE-REVISION.txt.
-The bundled core's exact version can be checked with `rill -v`
-(Contents/Resources/rill on macOS, next to the FlowBar executable elsewhere).
-LICENSE-RILL and NOTICE-RILL contain its license and origin. The notices of the code it is
-built from — Rust crates, BoringSSL, lwIP and, on Windows, the embedded Wintun driver
-(LICENSE-WINTUN.txt) — are in LICENSE-RILL-THIRD-PARTY.txt.
+mihomo: https://github.com/MetaCubeX/mihomo (GPL-3.0, whose license text is LICENSE-GPL-3.0).
+Release builds bundle an unmodified mihomo release binary; the release notes name its version
+and link its source. A local build may instead copy the user's already installed mihomo
+executable, for example from Clash Verge. It is copied into the package, so Clash Verge is not
+needed at runtime. The bundled core's exact version can be checked with `mihomo -v`
+(Contents/Resources/mihomo on macOS, next to the FlowBar executable elsewhere).
+No modifications are made to the core's source.
 
-The file named `mihomo` (`mihomo.exe` on Windows) is not a program and is never run: it is a
-text placeholder that lets FlowBar 0.4.0 and earlier, which bundled mihomo, update to this
+The file named `rill` (`rill.exe` on Windows) is not a program and is never run: it is a text
+placeholder that lets FlowBar 0.5.0 to 0.8.2, which bundled the rill core, update to this
 package.
 
 meta-rules-dat: https://github.com/MetaCubeX/meta-rules-dat (GPL-3.0, whose license text is

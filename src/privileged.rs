@@ -260,6 +260,8 @@ pub fn install(uid: u32) -> Result<()> {
     ] {
         config::atomic_write(&target, &fs::read(&source)?, mode)?;
     }
+    // The core an earlier helper ran; nothing starts it any more.
+    let _ = fs::remove_file(resources.join(supervisor::LEGACY_CORE));
     // Keep the app's signature metadata so Security can validate its running identity.
     let source_contents = std::env::current_exe()?
         .parent()

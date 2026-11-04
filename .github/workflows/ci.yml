@@ -12,8 +12,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RILL_VERSION: v0.1.5
-  RILL_REVISION: b781566560480bb4e826fc9200d965c333612421
+  # The bundled core: a mihomo release (https://github.com/MetaCubeX/mihomo/releases).
+  MIHOMO_VERSION: v1.19.33
 
 jobs:
   test:
@@ -24,13 +24,16 @@ jobs:
         include:
           - os: macos-15
             system: macos
-            target_core: aarch64-apple-darwin
+            core: darwin-arm64
+            sha256: 060b64b0f2c9a310831db0fe4adb2878de67bfa606c311813c1f13966aa504b6
           - os: ubuntu-22.04
             system: linux
-            target_core: x86_64-unknown-linux-musl
+            core: linux-amd64-compatible
+            sha256: 386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6
           - os: windows-2022
             system: windows
-            target_core: x86_64-pc-windows-msvc
+            core: windows-amd64-compatible
+            sha256: 7aaf636a4f2172dcd8ec34ac4f52797b059195e5afd6409508c963e545f8864d
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -39,7 +42,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Locate core
-        run: echo "CORE=$RUNNER_TEMP/rill/rill${{ matrix.system == 'windows' && '.exe' || '' }}" >> "$GITHUB_ENV"
+        run: echo "CORE=$RUNNER_TEMP/mihomo/mihomo${{ matrix.system == 'windows' && '.exe' || '' }}" >> "$GITHUB_ENV"
 
       - name: Install Linux dependencies
         if: matrix.system == 'linux'
@@ -47,10 +50,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev xvfb dbus python3-gi
 
-      - uses: ./.github/actions/build-core
-        with:
-          revision: ${{ env.RILL_REVISION }}
-          target: ${{ matrix.target_core }}
+      - name: Fetch mihomo
+        run: |
+          mkdir -p "$(dirname "$CORE")"
+          ./scripts/fetch-mihomo.sh "$MIHOMO_VERSION" ${{ matrix.core }} ${{ matrix.sha256 }} "$CORE"
 
       - name: Lint
         run: |

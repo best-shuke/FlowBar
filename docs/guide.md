@@ -90,7 +90,7 @@ macOS 和 Linux 上，卸载前先在设置里关掉「登录时打开」，再�
 
 **macOS**：登录时打开用的是系统登录项，第一次开启时系统可能会让你去登录项设置里批准。TUN 模式改的系统 DNS 在断开后会自动恢复。
 
-**Windows**：左键点托盘图标打开设置，右键打开菜单。TUN 用的是 rill 内置的 Wintun，不用另装驱动。
+**Windows**：左键点托盘图标打开设置，右键打开菜单。TUN 用的是 mihomo 自带的 Wintun，不用另装驱动。
 
 **Linux**：托盘基于 StatusNotifierItem，KDE Plasma 和 Xfce 直接能用，GNOME 需要 AppIndicator 扩展（Ubuntu 默认装了）。桌面没有托盘时，设置窗口就是主界面，关掉窗口会退出 FlowBar 并断开连接。TUN 通过 `pkexec` 提权，DNS 由 TUN 劫持，不会改系统的 DNS 设置。
 

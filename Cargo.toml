@@ -1,9 +1,9 @@
 [package]
 name = "flowbar"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Lightweight native menu bar and tray controller for the rill proxy core (mihomo-compatible)"
+description = "Lightweight native menu bar and tray controller for mihomo"
 repository = "https://github.com/best-shuke/FlowBar"
 license = "MIT"
 

@@ -200,7 +200,7 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
     config::private_dir(&data)?;
     let core = supervisor::core()?;
     run.diagnostic(format!("core={} data={}", core.display(), data.display()));
-    ensure!(core.is_file(), "应用中缺少 rill 内核，请重新打包。");
+    ensure!(core.is_file(), "应用中缺少 mihomo 内核，请重新打包。");
     let resources = supervisor::resources()?;
     let progress = |message: String| emit(Event::Progress(run.id.clone(), message));
     let mut missing = vec![];
@@ -232,7 +232,8 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
         .arg(&data)
         .arg("-f")
         .arg(&config_file)
-        .current_dir(&data);
+        .current_dir(&data)
+        .env("GOGC", "50");
     if let Some(home) = std::env::var_os("HOME") {
         validate.env("HOME", home);
     }
