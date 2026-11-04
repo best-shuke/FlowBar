@@ -411,7 +411,7 @@ pub fn smoke() -> Result<()> {
             .collect::<Vec<_>>();
         let secret = uuid::Uuid::new_v4().to_string();
         if valid {
-            config::private_write(&stage.join("config.yaml"), format!("mixed-port: {}\nexternal-controller: 127.0.0.1:{}\nsecret: {secret}\nlog-level: debug\ntun: {{enable: false}}\ndns: {{enable: false}}\nproxies: []\nproxy-groups: []\nrules: [MATCH,DIRECT]\n", ports[0], ports[1]).as_bytes())?;
+            config::private_write(&stage.join("config.yaml"), format!("mixed-port: {}\nexternal-controller: 127.0.0.1:{}\nsecret: {secret}\nlog-level: debug\ntun: {{enable: false}}\ndns: {{enable: false}}\nproxies: []\nproxy-groups: []\nrules: [\"MATCH,DIRECT\"]\n", ports[0], ports[1]).as_bytes())?;
         }
         drop(listeners);
         let result = request(uid, Request::Start(id.clone()), &identity);
