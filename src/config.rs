@@ -17,10 +17,24 @@ use uuid::Uuid;
 pub const DATA_DIR: &str = "Library/Application Support/FlowBar";
 #[cfg(target_os = "linux")]
 pub const DATA_DIR: &str = ".local/share/flowbar";
-#[cfg(target_os = "macos")]
-const TUN_DEVICE: &str = "utun";
+/// macOS names TUN devices `utun<N>` and mihomo replaces any other name with the next free
+/// one, so FlowBar leaves the choice to the core there.
 #[cfg(not(target_os = "macos"))]
 const TUN_DEVICE: &str = "FlowBar";
+/// Proxy types the bundled mihomo cannot load: rill's XPro, which FlowBar 0.5 to 0.8 ran.
+const UNSUPPORTED_PROXY_TYPES: &[&str] = &["xpro"];
+/// Policies mihomo defines itself, which groups and rules may name.
+const BUILTIN_POLICIES: &[&str] = &[
+    "DIRECT",
+    "REJECT",
+    "REJECT-DROP",
+    "COMPATIBLE",
+    "PASS",
+    "PASS-RULE",
+    "GLOBAL",
+];
+/// The log level when the profile sets none, mihomo's own default.
+const DEFAULT_LOG_LEVEL: &str = "info";
 
 pub const GEO_NAMES: &[&str] = &[
     "geoip.dat",
@@ -332,6 +346,15 @@ fn section<'a>(map: &'a mut Mapping, key: &str) -> Result<&'a mut Mapping> {
 }
 
 pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> {
+    Ok(render(yaml, settings, secret)?.yaml)
+}
+/// A runtime config and what FlowBar changed in the profile to make the core load it.
+pub struct Runtime {
+    pub yaml: String,
+    /// One line per kind of repair, for the session log and the connection progress.
+    pub notes: Vec<String>,
+}
+pub fn render(yaml: &str, settings: &Settings, secret: &str) -> Result<Runtime> {
     settings.validate()?;
     ensure!(!secret.is_empty(), "控制接口密钥不能为空。");
     let mut root = parse(yaml)?;
@@ -361,6 +384,7 @@ pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> 
         key.as_str()
             .is_none_or(|key| !key.ends_with("-server") && !key.ends_with("-config"))
     });
+    let notes = repair(map);
     set(map, "mixed-port", settings.proxy_port);
     for name in ["port", "socks-port", "redir-port", "tproxy-port"] {
         set(map, name, 0);
@@ -374,14 +398,37 @@ pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> 
     );
     set(map, "secret", secret);
     set(map, "mode", settings.mode.as_str());
-    set(map, "log-level", "debug");
+    // The profile's own log level; a missing or invalid one gets mihomo's default.
+    let level = map
+        .get("log-level")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .filter(|level| ["silent", "error", "warning", "info", "debug"].contains(&level.as_str()))
+        .unwrap_or_else(|| DEFAULT_LOG_LEVEL.into());
+    set(map, "log-level", level);
     set(map, "geodata-loader", "memconservative");
     // FlowBar's setting decides IPv6, whatever the profile says.
     set(map, "ipv6", settings.ipv6);
+    if settings.tun {
+        // A pinned interface overrides the TUN's detection of the live default route; once
+        // the network changes, every dial, the proxy servers' included, would leave through
+        // the wrong interface or the TUN itself.
+        map.remove("interface-name");
+        bypass_proxy_servers(map);
+    }
     let tun = section(map, "tun")?;
     set(tun, "enable", settings.tun);
     if settings.tun {
+        #[cfg(not(target_os = "macos"))]
         set(tun, "device", TUN_DEVICE);
+        #[cfg(target_os = "macos")]
+        if tun
+            .get("device")
+            .and_then(Value::as_str)
+            .is_none_or(|device| !valid_utun(device))
+        {
+            tun.remove("device");
+        }
         set(tun, "auto-route", true);
         set(tun, "auto-detect-interface", true);
         tun.entry(Value::from("stack"))
@@ -403,7 +450,222 @@ pub fn runtime(yaml: &str, settings: &Settings, secret: &str) -> Result<String> 
         dns.entry(Value::from("nameserver"))
             .or_insert(serde_yaml_ng::to_value(["223.5.5.5", "1.1.1.1"])?);
     }
-    Ok(serde_yaml_ng::to_string(&root)?)
+    Ok(Runtime {
+        yaml: serde_yaml_ng::to_string(&root)?,
+        notes,
+    })
+}
+/// The names mihomo accepts as a TUN device on macOS: `utun` and a number.
+#[cfg(any(target_os = "macos", test))]
+fn valid_utun(device: &str) -> bool {
+    device
+        .strip_prefix("utun")
+        .is_some_and(|index| !index.is_empty() && index.parse::<i16>().is_ok())
+}
+
+fn name_of(value: &Value) -> Option<String> {
+    match value {
+        Value::String(name) => Some(name.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+/// A few names, for a note that should stay one readable line.
+fn listed(names: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let mut text = names
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("、");
+    if names.len() > SHOWN {
+        text.push_str(&format!(" 等 {} 个", names.len()));
+    }
+    text
+}
+/// The policy a rule sends its traffic to, found the way mihomo splits a rule.
+fn rule_target(rule: &str) -> Option<(String, String)> {
+    let items: Vec<&str> = rule.split(',').map(str::trim).collect();
+    let kind = items[0].to_ascii_uppercase();
+    let target = match kind.as_str() {
+        "MATCH" => items.get(1)?,
+        "NOT" | "OR" | "AND" | "SUB-RULE" | "DOMAIN-REGEX" | "PROCESS-NAME-REGEX"
+        | "PROCESS-PATH-REGEX" => items.last().filter(|_| items.len() > 1)?,
+        _ => items.get(2)?,
+    };
+    Some((kind, (*target).to_owned()))
+}
+
+/// Makes a profile whose nodes were edited or deleted load again, without touching the
+/// imported copy. mihomo refuses a whole config over one unknown proxy type, one group member
+/// or rule target that no longer exists, or one group left without members. FlowBar drops
+/// what it cannot run and reports each kind of change.
+fn repair(map: &mut Mapping) -> Vec<String> {
+    let mut notes = vec![];
+    let mut proxies = vec![];
+    if let Some(list) = map.get_mut("proxies").and_then(Value::as_sequence_mut) {
+        let mut skipped = vec![];
+        list.retain(|proxy| {
+            let unsupported = proxy["type"].as_str().is_some_and(|kind| {
+                UNSUPPORTED_PROXY_TYPES.contains(&kind.to_ascii_lowercase().as_str())
+            });
+            if unsupported {
+                skipped.push(name_of(&proxy["name"]).unwrap_or_else(|| "未命名".into()));
+            }
+            !unsupported
+        });
+        if !skipped.is_empty() {
+            notes.push(format!(
+                "已跳过 {} 个 mihomo 不支持的 XPro 节点：{}",
+                skipped.len(),
+                listed(&skipped)
+            ));
+        }
+        proxies.extend(list.iter().filter_map(|proxy| name_of(&proxy["name"])));
+    }
+    let mut dangling = 0;
+    let mut touched = std::collections::BTreeSet::new();
+    let mut removed = vec![];
+    if let Some(groups) = map.get_mut("proxy-groups").and_then(Value::as_sequence_mut) {
+        // Removing an emptied group can empty the groups that only listed it.
+        loop {
+            let known: std::collections::HashSet<String> = proxies
+                .iter()
+                .cloned()
+                .chain(groups.iter().filter_map(|group| name_of(&group["name"])))
+                .chain(BUILTIN_POLICIES.iter().map(|name| (*name).to_owned()))
+                .collect();
+            for group in groups.iter_mut() {
+                let name = name_of(&group["name"]).unwrap_or_default();
+                let Some(members) = group.get_mut("proxies").and_then(Value::as_sequence_mut)
+                else {
+                    continue;
+                };
+                let before = members.len();
+                members.retain(|member| name_of(member).is_none_or(|m| known.contains(&m)));
+                if members.len() != before {
+                    dangling += before - members.len();
+                    touched.insert(name);
+                }
+            }
+            let before = groups.len();
+            groups.retain(|group| {
+                let members = group["proxies"]
+                    .as_sequence()
+                    .is_some_and(|m| !m.is_empty());
+                let providers = group["use"].as_sequence().is_some_and(|u| !u.is_empty());
+                let includes = [
+                    "include-all",
+                    "include-all-proxies",
+                    "include-all-providers",
+                ]
+                .iter()
+                .any(|key| group[*key].as_bool() == Some(true));
+                let empty = !members && !providers && !includes;
+                if empty {
+                    removed.push(name_of(&group["name"]).unwrap_or_default());
+                }
+                !empty
+            });
+            if groups.len() == before {
+                break;
+            }
+        }
+    }
+    if dangling > 0 {
+        notes.push(format!(
+            "已移除 {dangling} 处指向不存在节点或策略组的引用，涉及 {} 个策略组",
+            touched.len()
+        ));
+    }
+    if !removed.is_empty() {
+        notes.push(format!("已停用没有可用节点的策略组：{}", listed(&removed)));
+    }
+    let known: std::collections::HashSet<String> = proxies
+        .into_iter()
+        .chain(
+            map.get("proxy-groups")
+                .and_then(Value::as_sequence)
+                .into_iter()
+                .flatten()
+                .filter_map(|group| name_of(&group["name"])),
+        )
+        .chain(BUILTIN_POLICIES.iter().map(|name| (*name).to_owned()))
+        .collect();
+    let sub_rules: std::collections::HashSet<String> = map
+        .get("sub-rules")
+        .and_then(Value::as_mapping)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, _)| name_of(name))
+        .collect();
+    let mut dropped = 0;
+    let mut keep = |rule: &Value| {
+        let Some((kind, target)) = rule.as_str().and_then(rule_target) else {
+            return true;
+        };
+        let valid = if kind == "SUB-RULE" {
+            sub_rules.contains(&target) || known.contains(&target)
+        } else {
+            known.contains(&target)
+        };
+        if !valid {
+            dropped += 1;
+        }
+        valid
+    };
+    if let Some(rules) = map.get_mut("rules").and_then(Value::as_sequence_mut) {
+        rules.retain(&mut keep);
+    }
+    if let Some(subs) = map.get_mut("sub-rules").and_then(Value::as_mapping_mut) {
+        for (_, rules) in subs.iter_mut() {
+            if let Some(rules) = rules.as_sequence_mut() {
+                rules.retain(&mut keep);
+            }
+        }
+    }
+    if dropped > 0 {
+        notes.push(format!("已跳过 {dropped} 条指向不存在节点或策略组的规则"));
+    }
+    notes
+}
+
+/// Connections to a proxy server go out directly. A TUN captures every route, and whatever
+/// reaches one of these addresses through it, such as a dial that missed the physical
+/// interface, would otherwise be sent to a proxy again and loop until it times out.
+fn bypass_proxy_servers(map: &mut Mapping) {
+    let mut seen = std::collections::HashSet::new();
+    let bypass: Vec<Value> = map
+        .get("proxies")
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+        // A server behind dialer-proxy is reached through another node, never directly.
+        .filter(|proxy| proxy.get("dialer-proxy").is_none())
+        .filter_map(|proxy| proxy["server"].as_str())
+        .map(|server| server.trim().trim_start_matches('[').trim_end_matches(']'))
+        .filter(|server| !server.is_empty() && !server.contains(','))
+        .filter(|server| seen.insert(server.to_ascii_lowercase()))
+        .map(|server| match server.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => format!("IP-CIDR,{ip}/32,DIRECT,no-resolve"),
+            Ok(std::net::IpAddr::V6(ip)) => format!("IP-CIDR6,{ip}/128,DIRECT,no-resolve"),
+            Err(_) => format!("DOMAIN,{server},DIRECT"),
+        })
+        .map(Value::from)
+        .collect();
+    if bypass.is_empty() {
+        return;
+    }
+    match map.get_mut("rules").and_then(Value::as_sequence_mut) {
+        Some(rules) => {
+            rules.splice(0..0, bypass);
+        }
+        None => {
+            map.insert("rules".into(), Value::Sequence(bypass));
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -571,6 +833,113 @@ mod tests {
         }
         assert_eq!(root["tun"]["enable"].as_bool(), Some(true));
         assert_eq!(root["dns"]["listen"].as_str(), Some("127.0.0.1:15353"));
+    }
+    #[test]
+    fn repairs_deleted_and_xpro_nodes_without_touching_the_rest() {
+        let yaml = "proxies:\n  - {name: 东京, type: ss, server: jp.example.com, port: 443}\n  - {name: 旧, type: XPro, server: 1.2.3.4, port: 443}\nproxy-groups:\n  - {name: 代理, type: select, proxies: [香港, 东京, 旧, 专线, DIRECT]}\n  - {name: 专线, type: select, proxies: [旧, 已删除]}\n  - {name: 只有专线, type: url-test, proxies: [专线]}\n  - {name: 订阅, type: select, use: [sub]}\n  - {name: 全部, type: select, include-all: true, proxies: [已删除]}\nproxy-providers:\n  sub: {type: http, url: https://example.com/sub, path: ./sub.yaml}\nsub-rules:\n  内部: ['DOMAIN,a.com,专线', 'MATCH,代理']\nrules:\n  - DOMAIN,b.com,专线\n  - AND,((DOMAIN,c.com),(NETWORK,UDP)),只有专线\n  - DOMAIN-REGEX,^(d|e)\\.com$,代理\n  - SUB-RULE,(DOMAIN,f.com),内部\n  - GEOIP,CN,DIRECT,no-resolve\n  - MATCH,代理\n";
+        let output = render(
+            yaml,
+            &Settings {
+                tun: false,
+                ..Settings::default()
+            },
+            "secret",
+        )
+        .unwrap();
+        let root = parse(&output.yaml).unwrap();
+        let names = |value: &Value| -> Vec<String> {
+            value
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(name_of)
+                .collect()
+        };
+        assert_eq!(root["proxies"].as_sequence().unwrap().len(), 1);
+        let groups: Vec<_> = root["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|g| g["name"].as_str().unwrap().to_owned())
+            .collect();
+        // 专线 lost all its nodes, and 只有专线 listed nothing else.
+        assert_eq!(groups, ["代理", "订阅", "全部"]);
+        assert_eq!(
+            names(&root["proxy-groups"][0]["proxies"]),
+            ["东京", "DIRECT"]
+        );
+        assert!(names(&root["proxy-groups"][2]["proxies"]).is_empty());
+        assert_eq!(
+            names(&root["rules"]),
+            [
+                "DOMAIN-REGEX,^(d|e)\\.com$,代理",
+                "SUB-RULE,(DOMAIN,f.com),内部",
+                "GEOIP,CN,DIRECT,no-resolve",
+                "MATCH,代理"
+            ]
+        );
+        assert_eq!(names(&root["sub-rules"]["内部"]), ["MATCH,代理"]);
+        assert_eq!(output.notes.len(), 4, "{:?}", output.notes);
+        assert!(output.notes[0].contains("XPro") && output.notes[0].contains("旧"));
+        // An intact profile is left as it is.
+        let intact = render(
+            FIXTURE,
+            &Settings {
+                tun: false,
+                ..Settings::default()
+            },
+            "secret",
+        )
+        .unwrap();
+        assert!(intact.notes.is_empty());
+    }
+    #[test]
+    fn tun_sends_proxy_servers_direct_and_follows_the_live_interface() {
+        let yaml = "interface-name: en0\nlog-level: warning\nproxies:\n  - {name: a, type: ss, server: a.example.com}\n  - {name: b, type: ss, server: 203.0.113.7}\n  - {name: c, type: ss, server: '2001:db8::1'}\n  - {name: d, type: ss, server: A.example.com}\n  - {name: e, type: ss, server: inner.example.com, dialer-proxy: a}\nrules: ['MATCH,a']\n";
+        let root = parse(&runtime(yaml, &Settings::default(), "secret").unwrap()).unwrap();
+        let rules: Vec<_> = root["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            rules,
+            [
+                "DOMAIN,a.example.com,DIRECT",
+                "IP-CIDR,203.0.113.7/32,DIRECT,no-resolve",
+                "IP-CIDR6,2001:db8::1/128,DIRECT,no-resolve",
+                "MATCH,a"
+            ]
+        );
+        assert!(root.get("interface-name").is_none());
+        assert_eq!(root["log-level"].as_str(), Some("warning"));
+        let proxy = parse(
+            &runtime(
+                yaml,
+                &Settings {
+                    tun: false,
+                    ..Settings::default()
+                },
+                "secret",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(proxy["rules"].as_sequence().unwrap().len(), 1);
+        assert_eq!(proxy["interface-name"].as_str(), Some("en0"));
+        let unset = parse(&runtime(FIXTURE, &Settings::default(), "secret").unwrap()).unwrap();
+        assert_eq!(unset["log-level"].as_str(), Some("info"));
+    }
+    #[test]
+    fn macos_tun_names_follow_utun_numbering() {
+        assert!(valid_utun("utun4") && valid_utun("utun1024"));
+        assert!(!valid_utun("utun") && !valid_utun("FlowBar") && !valid_utun("utunx"));
+        let root = parse(&runtime(FIXTURE, &Settings::default(), "secret").unwrap()).unwrap();
+        #[cfg(target_os = "macos")]
+        assert!(root["tun"].get("device").is_none());
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(root["tun"]["device"].as_str(), Some(TUN_DEVICE));
     }
     #[test]
     fn prunes_only_old_ended_sessions() {

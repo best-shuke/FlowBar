@@ -193,7 +193,19 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
     emit(Event::Progress(run.id.clone(), "正在检查配置…".into()));
     let yaml = fs::read_to_string(config::profile_path(&run.settings.profile_name))
         .map_err(|_| anyhow::anyhow!("请先导入完整的 YAML 配置。"))?;
-    let runtime = config::runtime(&yaml, &run.settings, &run.api.secret)?;
+    let config::Runtime {
+        yaml: runtime,
+        notes,
+    } = config::render(&yaml, &run.settings, &run.api.secret)?;
+    for note in &notes {
+        run.diagnostic(format!("profile repaired: {note}"));
+    }
+    if !notes.is_empty() {
+        emit(Event::Progress(
+            run.id.clone(),
+            "配置中有已删除或内核不支持的节点，已自动跳过，正在检查配置…".into(),
+        ));
+    }
     let config_file = run.stage.join("config.yaml");
     config::private_write(&config_file, runtime.as_bytes())?;
     let data = config::home().join("Data");
@@ -313,7 +325,14 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
         if let Some(status) = supervisor::read_status(&run.status_path) {
             match status.state.as_str() {
                 "running" => break,
-                "failed" | "stopped" => bail!("内核未能启动，请打开日志检查端口或配置。"),
+                "failed" | "stopped" => {
+                    let log = crate::logging::tail(&run.status_path.join("core.log"), 65536)
+                        .unwrap_or_default();
+                    match core_error(&log) {
+                        Some(reason) => bail!("{}", failure("内核未能启动", &reason)),
+                        None => bail!("内核未能启动，请打开日志检查端口或配置。"),
+                    }
+                }
                 _ => {}
             }
         }
@@ -328,13 +347,23 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
     }
     // Both supervisors read the stage copy before reporting running.
     run.remove_config();
+    // A saved choice may name a node or group the profile no longer has; the UI forgets those
+    // once it sees the groups.
+    let order = run.group_order();
+    let available = run.api.groups(&order).unwrap_or_default();
     for (group, choice) in &run.settings.selections {
+        if !selectable(&available, group, choice) {
+            run.diagnostic(format!(
+                "skip stale selection group={group:?} choice={choice:?}"
+            ));
+            continue;
+        }
         let result = run.api.select(group, choice);
         run.diagnostic(format!(
             "restore selection group={group:?} choice={choice:?}: {result:?}"
         ));
     }
-    let groups = run.api.groups(&run.group_order()).unwrap_or_default();
+    let groups = run.api.groups(&order).unwrap_or(available);
     run.diagnostic(format!(
         "controller ready; {} groups; status_path={}",
         groups.len(),
@@ -415,8 +444,54 @@ fn validation_error(log: &str, data: &Path, fallback: &str) -> String {
              文件类型须与配置一致；也可将数据库放在 YAML 同目录后重新导入。详情见 validation.log。",
             data.display()
         )
+    } else if let Some(reason) = core_error(log) {
+        failure(fallback, &reason)
     } else {
         format!("{fallback}，请打开日志查看原因。")
+    }
+}
+/// Whether `choice` is one of the options of a group the user can pick in.
+pub(crate) fn selectable(groups: &[Group], group: &str, choice: &str) -> bool {
+    groups
+        .iter()
+        .any(|g| g.name == group && g.choices.iter().any(|c| c == choice))
+}
+/// The last error mihomo logged, in its own words. Its log lines read
+/// `time="…" level=error msg="…"`, with the message quoted Go-style.
+fn core_error(log: &str) -> Option<String> {
+    log.lines().rev().find_map(|line| {
+        let level = ["level=error", "level=fatal"]
+            .iter()
+            .any(|marker| line.contains(marker));
+        if !level {
+            return None;
+        }
+        let quoted = &line[line.find("msg=\"")? + 5..];
+        let mut message = String::new();
+        let mut characters = quoted.chars();
+        while let Some(c) = characters.next() {
+            match c {
+                '"' => break,
+                '\\' => match characters.next()? {
+                    'n' | 't' => message.push(' '),
+                    other => message.push(other),
+                },
+                c => message.push(c),
+            }
+        }
+        let message = message.trim().to_owned();
+        (!message.is_empty()).then_some(message)
+    })
+}
+/// A failure's first line names its cause; a long one continues below, where the dialog
+/// shows it in full.
+fn failure(what: &str, reason: &str) -> String {
+    const SHORT: usize = 80;
+    if reason.chars().count() <= SHORT {
+        format!("{what}：{reason}")
+    } else {
+        let short: String = reason.chars().take(SHORT).collect();
+        format!("{what}：{short}…\n\n{reason}\n\n完整日志见 FlowBar 的日志目录。")
     }
 }
 
@@ -623,21 +698,48 @@ mod validation_tests {
             validation_error("", &data, "配置检查未完成：操作超时，请查看日志。"),
             "配置检查未完成：操作超时，请打开日志查看原因。"
         );
+        // Without a core error line there is nothing more specific to say.
         assert_eq!(
             validation_error(
-                "rules[0] [GEOIP,CN,missing] error: proxy [missing] not found",
+                "configuration file config.yaml test failed",
                 &data,
                 "配置检查失败"
             ),
             "配置检查失败，请打开日志查看原因。"
         );
+        // mihomo's own reason replaces the bare pointer to the log.
+        let rejected = r#"time="2026-11-04T10:00:00+08:00" level=error msg="proxy 3: unsupport proxy type: xpro"
+configuration file config.yaml test failed"#;
         assert_eq!(
-            validation_error(
-                &format!("{finished}\nrules[0] error: proxy [missing] not found"),
-                &data,
-                "配置检查失败"
-            ),
-            "配置检查失败，请打开日志查看原因。"
+            validation_error(rejected, &data, "配置检查失败"),
+            "配置检查失败：proxy 3: unsupport proxy type: xpro"
         );
+        let quoted = format!(
+            "{finished}\n{}",
+            r#"time="x" level=error msg="rules[0] [MATCH,\"节点\"] error: proxy [节点] not found""#
+        );
+        assert_eq!(
+            validation_error(&quoted, &data, "配置检查失败"),
+            "配置检查失败：rules[0] [MATCH,\"节点\"] error: proxy [节点] not found"
+        );
+        let long = format!(r#"level=fatal msg="{}""#, "x".repeat(200));
+        let message = validation_error(&long, &data, "配置检查失败");
+        let (summary, detail) = message.split_once('\n').unwrap();
+        assert!(summary.starts_with("配置检查失败：xxx") && summary.ends_with('…'));
+        assert!(detail.contains(&"x".repeat(200)));
+        assert!(core_error(r#"level=warning msg="[TUN] Unsupported tunName(utun)""#).is_none());
+    }
+
+    #[test]
+    fn restores_only_choices_the_core_still_offers() {
+        let groups = [Group {
+            name: "代理".into(),
+            kind: "Selector".into(),
+            current: "东京".into(),
+            choices: vec!["东京".into(), "DIRECT".into()],
+        }];
+        assert!(selectable(&groups, "代理", "东京"));
+        assert!(!selectable(&groups, "代理", "已删除"));
+        assert!(!selectable(&groups, "已删除的组", "东京"));
     }
 }

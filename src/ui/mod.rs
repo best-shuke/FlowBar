@@ -581,6 +581,17 @@ impl App {
                         ui.message = message
                     }
                     Event::Ready(id, groups) if current.as_deref() == Some(&id) => {
+                        // Forget choices of nodes or groups the profile no longer has, so
+                        // they are not restored again; the core skipped them already.
+                        if !groups.is_empty() {
+                            let before = ui.settings.selections.len();
+                            ui.settings.selections.retain(|group, choice| {
+                                crate::engine::selectable(&groups, group, choice)
+                            });
+                            if ui.settings.selections.len() != before {
+                                error = ui.settings.save().err();
+                            }
+                        }
                         ui.groups = groups;
                         groups_changed = true;
                         ui.phase = Phase::Running;
