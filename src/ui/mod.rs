@@ -21,6 +21,7 @@ use crate::{
     api::Group,
     config::{self, Settings},
     engine::{self, Emit, Event, Run},
+    subscription::{self, Download, Subscription},
     update::{self, Release},
 };
 use anyhow::{Context, Result, ensure};
@@ -68,6 +69,12 @@ pub enum Action {
     Connect,
     Settings,
     Import,
+    /// Asks whether to import a file or a subscription link, for the settings window.
+    ImportChoice,
+    /// Imports a profile from a subscription link the user enters.
+    Subscribe,
+    /// Downloads every subscription again now.
+    UpdateSubscriptions,
     Reveal,
     Quit,
     Tun,
@@ -177,6 +184,8 @@ pub trait Shell {
     /// The settings window's values, while it is open.
     fn form(&self) -> Option<Form>;
     fn choose_profile(&self) -> Option<PathBuf>;
+    /// Asks for one line of text, such as a subscription link; `None` when cancelled.
+    fn ask_text(&self, title: &str, message: &str, placeholder: &str) -> Option<String>;
     /// Shows a modal message and returns the index of the clicked button; without
     /// buttons it offers a single OK. A dismissed alert returns `buttons.len()`.
     fn alert(&self, title: &str, message: &str, buttons: &[&str]) -> usize;
@@ -206,6 +215,13 @@ pub struct Ui {
     pub delays: HashMap<String, Option<u16>>,
     /// Groups whose latency test is running.
     testing: HashSet<String>,
+    /// A new subscription link is downloading.
+    subscribing: bool,
+    /// Profiles whose subscription is downloading.
+    updating: HashSet<String>,
+    /// The active profile's subscription brought a new copy that the running connection
+    /// does not use yet.
+    stale: bool,
     /// Connect again once the connection has stopped, after switching profiles.
     reconnect: bool,
     pub run: Option<Arc<Run>>,
@@ -234,6 +250,7 @@ impl Ui {
         self.testing.clear();
         self.refreshing = false;
         self.operation = false;
+        self.stale = false;
     }
 }
 impl Default for Ui {
@@ -246,6 +263,9 @@ impl Default for Ui {
             profiles: config::profiles(),
             delays: HashMap::new(),
             testing: HashSet::new(),
+            subscribing: false,
+            updating: HashSet::new(),
+            stale: false,
             reconnect: false,
             run: None,
             log: None,
@@ -366,6 +386,20 @@ impl App {
             Action::Connect => self.connect(shell)?,
             Action::Settings => shell.show_settings(),
             Action::Import => self.import(shell)?,
+            Action::ImportChoice => {
+                ensure!(self.stopped(), "请先停止连接，再导入配置。");
+                match shell.alert(
+                    "导入配置",
+                    "可以导入本机的 mihomo YAML 文件，或者粘贴订阅链接。订阅会自动更新。",
+                    &["选择 YAML 文件…", "从订阅链接导入…", "取消"],
+                ) {
+                    0 => self.import(shell)?,
+                    1 => self.subscribe(shell)?,
+                    _ => {}
+                }
+            }
+            Action::Subscribe => self.subscribe(shell)?,
+            Action::UpdateSubscriptions => self.update_subscriptions(shell, true),
             Action::Reveal => {
                 let path = config::profile_path(&self.ui.borrow().settings.profile_name);
                 sys::open(&path, true)
@@ -570,6 +604,7 @@ impl App {
         let mut errors = vec![];
         let mut notices = vec![];
         let (mut offer, mut staged, mut due, mut restart) = (None, None, false, false);
+        let mut downloads = vec![];
         for event in events {
             let current = self.ui.borrow().run.as_ref().map(|r| r.id.clone());
             let mut error = None;
@@ -685,6 +720,11 @@ impl App {
                         handled = false;
                         due = true;
                     }
+                    // Saving a download may ask about a name, so it runs after this batch.
+                    Event::Subscription(event) => {
+                        handled = false;
+                        downloads.push(event);
+                    }
                     Event::Update(update::Event::Checked(manual, result)) => {
                         ui.update = Update::Idle;
                         match result {
@@ -755,8 +795,12 @@ impl App {
         if let Some(staging) = staged {
             self.install_update(shell, &staging);
         }
+        for event in downloads {
+            self.finish_download(shell, event);
+        }
         if due {
             self.update_due(shell);
+            self.update_subscriptions(shell, false);
         }
         self.advance_smoke(shell);
     }
@@ -874,39 +918,46 @@ impl App {
         }
         self.committing.set(false);
     }
+    /// The name for a newly imported profile; when one with the same name exists, the user
+    /// replaces it, picks a numbered name, or cancels with `None`.
+    fn profile_name_for(&self, shell: &dyn Shell, name: &str, hint: &str) -> Option<String> {
+        // Profile names are file names, which may ignore case.
+        let profiles = self.ui.borrow().profiles.clone();
+        let existing = |name: &str| {
+            profiles
+                .iter()
+                .find(|p| p.to_lowercase() == name.to_lowercase())
+                .cloned()
+        };
+        let Some(current) = existing(name) else {
+            return Some(name.into());
+        };
+        let choice = shell.alert(
+            &format!("已有名为「{current}」的配置"),
+            hint,
+            &["替换", "另存为新配置", "取消"],
+        );
+        match choice {
+            // Replace the existing copy under its own spelling, or a case-sensitive
+            // file system would keep both and others would show the old name.
+            0 => Some(current),
+            1 => (2..)
+                .map(|number| format!("{name} {number}"))
+                .find(|name| existing(name).is_none()),
+            _ => None,
+        }
+    }
     fn import(&self, shell: &dyn Shell) -> Result<()> {
         ensure!(self.stopped(), "请先停止连接，再导入配置。");
         if let Some(path) = shell.choose_profile() {
             let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-            let mut name = config::profile_name(&stem);
-            // Profile names are file names, which may ignore case.
-            let profiles = self.ui.borrow().profiles.clone();
-            let existing = |name: &str| {
-                profiles
-                    .iter()
-                    .find(|p| p.to_lowercase() == name.to_lowercase())
-                    .cloned()
+            let Some(name) = self.profile_name_for(
+                shell,
+                &config::profile_name(&stem),
+                "可以用这个文件替换它（如果它是订阅，会停止自动更新），或者另存为新配置。",
+            ) else {
+                return Ok(());
             };
-            let taken = |name: &str| existing(name).is_some();
-            if let Some(current) = existing(&name) {
-                let choice = shell.alert(
-                    &format!("已有名为「{current}」的配置"),
-                    "订阅更新后可以替换它；导入另一个同名文件时，可以另存为新配置。",
-                    &["替换", "另存为新配置", "取消"],
-                );
-                match choice {
-                    // Replace the existing copy under its own spelling, or a case-sensitive
-                    // file system would keep both and others would show the old name.
-                    0 => name = current,
-                    1 => {
-                        name = (2..)
-                            .map(|number| format!("{name} {number}"))
-                            .find(|name| !taken(name))
-                            .unwrap()
-                    }
-                    _ => return Ok(()),
-                }
-            }
             let settings = config::import_profile(&path, Some(&name))?;
             let mut ui = self.ui.borrow_mut();
             ui.profiles = config::profiles();
@@ -914,6 +965,232 @@ impl App {
             ui.settings = settings;
         }
         shell.render();
+        Ok(())
+    }
+    /// Asks for a subscription link and downloads it in the background.
+    fn subscribe(&self, shell: &dyn Shell) -> Result<()> {
+        ensure!(self.stopped(), "请先停止连接，再导入配置。");
+        ensure!(!self.ui.borrow().subscribing, "正在下载订阅，请稍候。");
+        let Some(url) = shell.ask_text(
+            "从订阅链接导入",
+            "粘贴以 https:// 开头的订阅链接。FlowBar 会下载其中的 mihomo 配置，之后按服务器建议的间隔（默认每天）自动更新。",
+            "https://",
+        ) else {
+            return Ok(());
+        };
+        let url = subscription::normalize(&url)?;
+        self.ui.borrow_mut().subscribing = true;
+        shell.render();
+        let emit = self.emit.clone();
+        thread::spawn(move || {
+            let result = subscription::fetch(&url, None, None).map_err(|e| format!("{e:#}"));
+            emit(Event::Subscription(subscription::Event::Imported(
+                url, result,
+            )));
+        });
+        Ok(())
+    }
+    /// Downloads the subscriptions that are due, or all of them on request.
+    fn update_subscriptions(&self, shell: &dyn Shell, manual: bool) {
+        let proxy = self.update_proxy();
+        let now = subscription::now();
+        let jobs: Vec<_> = {
+            let mut ui = self.ui.borrow_mut();
+            let Ui {
+                settings,
+                profiles,
+                updating,
+                ..
+            } = &mut *ui;
+            let jobs: Vec<_> = settings
+                .subscriptions
+                .iter()
+                .filter(|(name, subscription)| {
+                    profiles.contains(name)
+                        && !updating.contains(*name)
+                        && (manual || subscription.due(now))
+                })
+                .map(|(name, subscription)| {
+                    // A manual update downloads in full, in case the saved copy was edited.
+                    let etag = (!manual).then(|| subscription.etag.clone()).flatten();
+                    (name.clone(), subscription.url.clone(), etag)
+                })
+                .collect();
+            updating.extend(jobs.iter().map(|(name, _, _)| name.clone()));
+            jobs
+        };
+        if jobs.is_empty() {
+            return;
+        }
+        shell.render();
+        for (name, url, etag) in jobs {
+            let emit = self.emit.clone();
+            thread::spawn(move || {
+                let result =
+                    subscription::fetch(&url, etag.as_deref(), proxy).map_err(|e| format!("{e:#}"));
+                emit(Event::Subscription(subscription::Event::Updated {
+                    name,
+                    url,
+                    manual,
+                    result,
+                }));
+            });
+        }
+    }
+    fn finish_download(&self, shell: &dyn Shell, event: subscription::Event) {
+        let result = match event {
+            subscription::Event::Imported(url, result) => {
+                self.ui.borrow_mut().subscribing = false;
+                match result {
+                    Ok(download) => self.add_subscription(shell, url, download),
+                    Err(message) => Err(anyhow::anyhow!("导入订阅失败：{message}")),
+                }
+            }
+            subscription::Event::Updated {
+                name,
+                url,
+                manual,
+                result,
+            } => {
+                self.ui.borrow_mut().updating.remove(&name);
+                self.subscription_updated(shell, &name, &url, manual, result)
+            }
+        };
+        shell.render();
+        if let Err(error) = result {
+            self.error(shell, &error.to_string());
+            shell.render();
+        }
+    }
+    /// Saves a new subscription's first download as a profile and makes it active.
+    fn add_subscription(&self, shell: &dyn Shell, url: String, download: Download) -> Result<()> {
+        let yaml = download.yaml.as_deref().context("服务器没有返回配置。")?;
+        // A connection may have started while the profile downloaded.
+        ensure!(self.stopped(), "请先停止连接，再导入配置。");
+        let known = self
+            .ui
+            .borrow()
+            .settings
+            .subscriptions
+            .iter()
+            .find(|(name, subscription)| {
+                subscription.url == url && self.ui.borrow().profiles.contains(name)
+            })
+            .map(|(name, _)| name.clone());
+        // The same link again refreshes its profile; another one needs a free name.
+        let name = match known {
+            Some(name) => name,
+            None => {
+                let Some(name) = self.profile_name_for(
+                    shell,
+                    &subscription::suggested_name(&download, &url),
+                    "可以用这个订阅替换它，或者另存为新配置。",
+                ) else {
+                    return Ok(());
+                };
+                name
+            }
+        };
+        config::store_profile(&name, yaml)?;
+        let mut settings = self.ui.borrow().settings.clone();
+        let mut entry = Subscription::new(url);
+        entry.checked(&download, subscription::now());
+        let interval = entry.interval;
+        settings.subscriptions.insert(name.clone(), entry);
+        settings.switch_profile(&name);
+        // The new copy may have renamed its groups and nodes.
+        settings.selections.clear();
+        settings.mode = "rule".into();
+        settings.save()?;
+        {
+            let mut ui = self.ui.borrow_mut();
+            ui.profiles = config::profiles();
+            ui.summary = profile_summary(&name);
+            ui.settings = settings;
+        }
+        shell.render();
+        let stats = profile_summary(&name).unwrap_or_default();
+        shell.alert(
+            &format!("已导入订阅「{name}」"),
+            &format!("{stats}。\n\n每 {interval} 小时自动更新一次，也可以在菜单「配置 → 更新订阅」中手动更新。"),
+            &[],
+        );
+        Ok(())
+    }
+    fn subscription_updated(
+        &self,
+        shell: &dyn Shell,
+        name: &str,
+        url: &str,
+        manual: bool,
+        result: Result<Download, String>,
+    ) -> Result<()> {
+        let now = subscription::now();
+        let mut settings = self.ui.borrow().settings.clone();
+        // The profile may have been removed, or replaced by another link, meanwhile.
+        let Some(entry) = settings
+            .subscriptions
+            .get_mut(name)
+            .filter(|entry| entry.url == url)
+        else {
+            return Ok(());
+        };
+        let download = match result {
+            Ok(download) => download,
+            Err(message) => {
+                entry.error = Some(message.clone());
+                entry.failed = now;
+                settings.save()?;
+                self.ui.borrow_mut().settings = settings;
+                ensure!(!manual, "更新订阅「{name}」失败：{message}");
+                return Ok(());
+            }
+        };
+        let path = config::profile_path(name);
+        let changed = match download.yaml.as_deref() {
+            Some(yaml) if fs::read_to_string(&path).ok().as_deref() != Some(yaml) => {
+                config::store_profile(name, yaml)?;
+                true
+            }
+            _ => false,
+        };
+        entry.checked(&download, now);
+        settings.save()?;
+        let (active, running) = {
+            let mut ui = self.ui.borrow_mut();
+            ui.settings = settings;
+            let active = ui.settings.profile_name == name;
+            if changed && active {
+                ui.summary = profile_summary(name);
+            }
+            // A connection that is still starting may already have read the old copy.
+            (active, !matches!(ui.phase, Phase::Stopped | Phase::Failed))
+        };
+        let mut reconnecting = false;
+        if changed && active && running {
+            let ready = {
+                let ui = self.ui.borrow();
+                ui.phase == Phase::Running && ui.menu_enabled()
+            };
+            if manual && ready {
+                // Restart with the new copy, as switching profiles does.
+                self.ui.borrow_mut().reconnect = true;
+                self.connect(shell)?;
+                reconnecting = true;
+            } else {
+                // An automatic update does not interrupt the connection.
+                self.ui.borrow_mut().stale = true;
+            }
+        }
+        if manual {
+            let text = match (changed, reconnecting, active && running) {
+                (true, true, _) => "已下载新配置，正在重新连接以使用它。",
+                (true, false, true) => "已下载新配置，重新连接后生效。",
+                (true, false, false) => "已下载新配置。",
+                (false, ..) => "配置没有变化。",
+            };
+            shell.alert(&format!("订阅「{name}」已更新"), text, &[]);
+        }
         Ok(())
     }
     /// Local proxy for update requests while it runs; TUN already routes them.
@@ -1032,6 +1309,36 @@ impl App {
             profiles.push(Entry::Separator);
         }
         profiles.push(item("导入 YAML…", Some(Action::Import), stopped, None));
+        profiles.push(item(
+            if ui.subscribing {
+                "正在下载订阅…"
+            } else {
+                "从订阅链接导入…"
+            },
+            Some(Action::Subscribe),
+            stopped && !ui.subscribing,
+            None,
+        ));
+        let subscribed = ui
+            .settings
+            .subscriptions
+            .keys()
+            .any(|name| ui.profiles.contains(name));
+        if subscribed {
+            profiles.push(item(
+                if ui.updating.is_empty() {
+                    "更新订阅"
+                } else {
+                    "正在更新订阅…"
+                },
+                Some(Action::UpdateSubscriptions),
+                ui.updating.is_empty() && enabled,
+                None,
+            ));
+        }
+        if let Some(status) = subscription_status(&ui) {
+            profiles.push(item(&status, None, false, None));
+        }
         if active {
             profiles.push(item(
                 "删除当前配置…",
@@ -1164,10 +1471,11 @@ impl App {
             switchable: !ui.profiles.is_empty() && ui.menu_enabled(),
             profiles,
             profile_index,
-            stats: ui
-                .summary
-                .clone()
-                .unwrap_or_else(|| "导入完整的 mihomo YAML 配置后即可连接。".into()),
+            stats: match (&ui.summary, subscription_status(&ui)) {
+                (Some(summary), Some(status)) => format!("{summary} · {status}"),
+                (Some(summary), None) => summary.clone(),
+                (None, _) => "导入 mihomo YAML 配置或订阅链接后即可连接。".into(),
+            },
             editable: stopped,
             tun: ui.settings.tun,
             tun_hint: if ui.settings.tun {
@@ -1271,6 +1579,29 @@ fn update_entry(update: &Update) -> (String, Option<Action>) {
         Update::Downloading(release) => (format!("正在下载 {}…", release.version()), None),
     }
 }
+/// The active profile's subscription state, for the menu and the settings window.
+fn subscription_status(ui: &Ui) -> Option<String> {
+    let name = &ui.settings.profile_name;
+    let entry = ui.settings.subscriptions.get(name)?;
+    if !ui.profiles.contains(name) {
+        return None;
+    }
+    Some(if ui.updating.contains(name) {
+        "订阅更新中…".into()
+    } else if ui.stale {
+        "订阅已更新，重新连接后生效".into()
+    } else if entry.error.is_some() {
+        format!(
+            "订阅更新失败（{}），稍后重试",
+            subscription::ago(entry.failed, subscription::now())
+        )
+    } else {
+        format!(
+            "订阅 {}更新",
+            subscription::ago(entry.updated, subscription::now())
+        )
+    })
+}
 /// Counts shown in the settings window. Parsing a large profile is costly, so callers cache it.
 fn profile_summary(name: &str) -> Option<String> {
     let yaml = fs::read_to_string(config::profile_path(name)).ok()?;
@@ -1308,4 +1639,198 @@ fn login_roundtrip() -> Result<()> {
     ensure!(login_status() == Login::Disabled, "登录项撤销失败");
     println!("PASS login item registration/unregistration");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// A front end that records alerts and answers them from a script.
+    #[derive(Default)]
+    struct Mock {
+        answers: RefCell<VecDeque<usize>>,
+        alerts: RefCell<Vec<String>>,
+    }
+    impl Shell for Mock {
+        fn render(&self) {}
+        fn show_settings(&self) {}
+        fn close_settings(&self) {}
+        fn settings_open(&self) -> bool {
+            false
+        }
+        fn form(&self) -> Option<Form> {
+            None
+        }
+        fn choose_profile(&self) -> Option<PathBuf> {
+            None
+        }
+        fn ask_text(&self, _: &str, _: &str, _: &str) -> Option<String> {
+            None
+        }
+        fn alert(&self, title: &str, _message: &str, buttons: &[&str]) -> usize {
+            self.alerts.borrow_mut().push(title.into());
+            self.answers
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(buttons.len())
+        }
+        fn schedule_updates(&self) {}
+        fn quit(&self) {}
+    }
+    impl Mock {
+        fn take_alerts(&self) -> Vec<String> {
+            std::mem::take(&mut self.alerts.borrow_mut())
+        }
+    }
+    fn profile(nodes: &[&str]) -> String {
+        let mut yaml = String::from("proxies:\n");
+        for node in nodes {
+            yaml.push_str(&format!("  - {{name: {node}, type: direct}}\n"));
+        }
+        yaml + "rules:\n  - MATCH,DIRECT\n"
+    }
+    fn download(yaml: Option<String>, etag: &str) -> Download {
+        Download {
+            yaml,
+            name: Some("zgo-or".into()),
+            interval: Some(12),
+            etag: Some(etag.into()),
+        }
+    }
+
+    #[test]
+    fn imports_and_updates_subscriptions() {
+        let temporary = tempfile::tempdir().unwrap();
+        config::TEST_HOME.with(|home| *home.borrow_mut() = Some(temporary.path().into()));
+        let app = App::new(|| {});
+        let shell = Mock::default();
+        let link = "https://sub.example.com/sub/first".to_string();
+        let imported = |url: &str, result| {
+            app.finish_download(&shell, subscription::Event::Imported(url.into(), result))
+        };
+        let updated = |url: &str, manual, result| {
+            app.finish_download(
+                &shell,
+                subscription::Event::Updated {
+                    name: "zgo-or".into(),
+                    url: url.into(),
+                    manual,
+                    result,
+                },
+            )
+        };
+        let saved = |name: &str| fs::read_to_string(config::profile_path(name)).unwrap();
+
+        // The first download becomes the active profile, named after the server's file.
+        imported(&link, Ok(download(Some(profile(&["a"])), "\"1\"")));
+        assert_eq!(shell.take_alerts(), ["已导入订阅「zgo-or」"]);
+        {
+            let ui = app.ui.borrow();
+            assert_eq!(ui.settings.profile_name, "zgo-or");
+            assert_eq!(ui.profiles, ["zgo-or"]);
+            let entry = &ui.settings.subscriptions["zgo-or"];
+            assert_eq!((entry.url.as_str(), entry.interval), (link.as_str(), 12));
+            assert_eq!(entry.etag.as_deref(), Some("\"1\""));
+            assert!(subscription_status(&ui).unwrap().starts_with("订阅 刚刚"));
+        }
+        assert_eq!(saved("zgo-or"), profile(&["a"]));
+        assert_eq!(Settings::load().subscriptions.len(), 1, "saved to disk");
+        let menu = app.menu(Login::Disabled);
+        let Some(Entry::Menu { entries, .. }) = menu
+            .iter()
+            .find(|entry| matches!(entry, Entry::Menu { title, .. } if title == "配置：zgo-or"))
+        else {
+            panic!("the profile submenu is missing");
+        };
+        let titles: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Item { title, action, .. } => Some((title.as_str(), action.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(titles.contains(&("从订阅链接导入…", Some(Action::Subscribe))));
+        assert!(titles.contains(&("更新订阅", Some(Action::UpdateSubscriptions))));
+        assert!(titles.contains(&("订阅 刚刚更新", None)));
+
+        // Another link with the same file name asks, and can be kept as a second profile.
+        shell.answers.borrow_mut().push_back(1);
+        imported(
+            "https://other.example.com/x",
+            Ok(download(Some(profile(&["b"])), "\"x\"")),
+        );
+        assert_eq!(
+            shell.take_alerts(),
+            ["已有名为「zgo-or」的配置", "已导入订阅「zgo-or 2」"]
+        );
+        assert_eq!(app.ui.borrow().profiles, ["zgo-or", "zgo-or 2"]);
+        // The same link again refreshes its own profile without asking.
+        imported(&link, Ok(download(Some(profile(&["a"])), "\"1\"")));
+        assert_eq!(shell.take_alerts(), ["已导入订阅「zgo-or」"]);
+        assert_eq!(app.ui.borrow().profiles.len(), 2);
+
+        // An automatic update saves new content quietly and keeps the node choices.
+        app.ui
+            .borrow_mut()
+            .settings
+            .selections
+            .insert("proxy".into(), "a".into());
+        updated(
+            &link,
+            false,
+            Ok(download(Some(profile(&["a", "c"])), "\"2\"")),
+        );
+        assert!(shell.take_alerts().is_empty());
+        assert_eq!(saved("zgo-or"), profile(&["a", "c"]));
+        assert_eq!(app.ui.borrow().settings.selections["proxy"], "a");
+        assert_eq!(
+            app.ui.borrow().settings.subscriptions["zgo-or"]
+                .etag
+                .as_deref(),
+            Some("\"2\"")
+        );
+        // An unchanged profile keeps its copy and reports so when asked for.
+        updated(&link, true, Ok(download(None, "\"2\"")));
+        assert_eq!(shell.take_alerts(), ["订阅「zgo-or」已更新"]);
+        assert_eq!(saved("zgo-or"), profile(&["a", "c"]));
+
+        // A failed automatic update is recorded for a later retry; a manual one is reported.
+        updated(&link, false, Err("HTTP 404".into()));
+        assert!(shell.take_alerts().is_empty());
+        {
+            let ui = app.ui.borrow();
+            let entry = &ui.settings.subscriptions["zgo-or"];
+            assert!(entry.error.is_some() && entry.failed > 0);
+            assert!(!entry.due(subscription::now()));
+            assert!(subscription_status(&ui).unwrap().contains("失败"));
+        }
+        updated(&link, true, Err("HTTP 404".into()));
+        assert_eq!(shell.take_alerts(), ["FlowBar"]);
+        assert_eq!(saved("zgo-or"), profile(&["a", "c"]));
+        // A result for a link the profile no longer uses is dropped.
+        updated(
+            "https://old.example.com/x",
+            true,
+            Ok(download(Some(profile(&["z"])), "\"z\"")),
+        );
+        assert!(shell.take_alerts().is_empty());
+        assert_eq!(saved("zgo-or"), profile(&["a", "c"]));
+
+        // Content that is not a profile never reaches the saved copy.
+        imported(&link, Err("订阅内容不是可用的 mihomo 配置".into()));
+        assert_eq!(shell.take_alerts(), ["FlowBar"]);
+        assert_eq!(saved("zgo-or"), profile(&["a", "c"]));
+
+        // Removing a profile, or replacing it with a local file, ends its subscription.
+        app.act(&shell, Action::Profile("zgo-or 2".into())).unwrap();
+        shell.answers.borrow_mut().push_back(0);
+        app.act(&shell, Action::RemoveProfile).unwrap();
+        let file = temporary.path().join("zgo-or.yaml");
+        fs::write(&file, profile(&["local"])).unwrap();
+        let settings = config::import_profile(&file, Some("zgo-or")).unwrap();
+        assert!(settings.subscriptions.is_empty());
+        assert_eq!(config::profiles(), ["zgo-or"]);
+        config::TEST_HOME.with(|home| *home.borrow_mut() = None);
+    }
 }

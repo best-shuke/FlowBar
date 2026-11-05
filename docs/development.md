@@ -112,6 +112,7 @@ CI 会把打包好的 macOS 应用存成 `FlowBar-macos-arm64` 附件，保留 1
 | `src/process.rs` | 子进程生命周期 |
 | `src/api.rs` | 调用 mihomo 控制接口 |
 | `src/update.rs` | 检查和安装更新 |
+| `src/subscription.rs` | 下载和检查订阅链接，安排自动更新 |
 | `src/ui/mod.rs` | 三个平台共用的界面状态、菜单和操作 |
 | `src/ui/macos.rs`、`windows.rs`、`linux.rs` | AppKit、Win32、GTK 4 界面 |
 | `src/ui/icon.rs` | 绘制 Windows 和 Linux 的托盘图标 |

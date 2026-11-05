@@ -23,6 +23,7 @@ const CSS: &str = "
     padding: 12px 14px;
 }
 .flowbar-secondary { font-size: smaller; opacity: 0.7; }
+.flowbar-heading { font-weight: bold; }
 .flowbar-port { font-feature-settings: \"tnum\"; }
 .flowbar-dot { font-size: 9px; }
 .flowbar-dot.stopped { opacity: 0.3; }
@@ -235,6 +236,85 @@ impl Shell for Linux {
         main_loop.run();
         chosen.take()
     }
+    fn ask_text(&self, title: &str, message: &str, placeholder: &str) -> Option<String> {
+        let dialog = gtk::Window::builder()
+            .title("FlowBar")
+            .modal(true)
+            .resizable(false)
+            .build();
+        if let Some(window) = self.window.borrow().clone() {
+            dialog.set_transient_for(Some(&window.native));
+        }
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        content.set_margin_top(18);
+        content.set_margin_bottom(16);
+        content.set_margin_start(20);
+        content.set_margin_end(20);
+        content.set_size_request(440, -1);
+        content.append(&label(title, "flowbar-heading"));
+        let text = label(message, "flowbar-secondary");
+        text.set_wrap(true);
+        text.set_wrap_mode(pango::WrapMode::WordChar);
+        text.set_max_width_chars(48);
+        content.append(&text);
+        let entry = gtk::Entry::new();
+        entry.set_placeholder_text(Some(placeholder));
+        entry.set_input_purpose(gtk::InputPurpose::Url);
+        entry.set_activates_default(true);
+        content.append(&entry);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk::Align::End);
+        buttons.set_margin_top(6);
+        let cancel = gtk::Button::with_label("取消");
+        let accept = gtk::Button::with_label("导入");
+        accept.add_css_class("suggested-action");
+        buttons.append(&cancel);
+        buttons.append(&accept);
+        content.append(&buttons);
+        dialog.set_child(Some(&content));
+        dialog.set_default_widget(Some(&accept));
+
+        let result = Rc::new(RefCell::new(None));
+        let main_loop = glib::MainLoop::new(None, false);
+        accept.connect_clicked({
+            let result = result.clone();
+            let entry = entry.clone();
+            let dialog = dialog.clone();
+            move |_| {
+                *result.borrow_mut() = Some(entry.text().to_string());
+                dialog.close();
+            }
+        });
+        cancel.connect_clicked({
+            let dialog = dialog.clone();
+            move |_| dialog.close()
+        });
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed({
+            let dialog = dialog.clone();
+            move |_, key, _, _| {
+                if key == gdk::Key::Escape {
+                    dialog.close();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        });
+        dialog.add_controller(keys);
+        // Closing destroys the window, which also drops the button handlers.
+        dialog.connect_close_request({
+            let main_loop = main_loop.clone();
+            move |_| {
+                main_loop.quit();
+                glib::Propagation::Proceed
+            }
+        });
+        dialog.present();
+        entry.grab_focus();
+        main_loop.run();
+        result.take()
+    }
     #[allow(deprecated)]
     fn alert(&self, title: &str, message: &str, buttons: &[&str]) -> usize {
         let dialog = gtk::MessageDialog::builder()
@@ -425,7 +505,7 @@ impl Linux {
         let card = section("配置", None);
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let profiles = profile_list();
-        let import = button("导入 YAML…", Action::Import);
+        let import = button("导入配置…", Action::ImportChoice);
         let reveal = button("打开所在文件夹", Action::Reveal);
         row.append(&profiles);
         row.append(&import);

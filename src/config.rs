@@ -1,3 +1,4 @@
+use crate::subscription::Subscription;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value};
@@ -64,6 +65,8 @@ pub struct Settings {
     pub selections: BTreeMap<String, String>,
     /// Node choices of the other profiles, restored when one becomes active again.
     pub profile_selections: BTreeMap<String, BTreeMap<String, String>>,
+    /// The links of profiles imported from a subscription, by profile name.
+    pub subscriptions: BTreeMap<String, Subscription>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -79,6 +82,7 @@ impl Default for Settings {
             auto_update: true,
             selections: BTreeMap::new(),
             profile_selections: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
         }
     }
 }
@@ -135,6 +139,7 @@ impl Settings {
             _ => {}
         }
         self.selections.clear();
+        self.subscriptions.remove(&self.profile_name);
         let next = profiles()
             .into_iter()
             .next()
@@ -206,12 +211,24 @@ fn migrate_profile(settings: &mut Settings) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(test)]
+thread_local! {
+    /// A test's private data directory, so tests need not change the process environment.
+    pub static TEST_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
 pub fn home() -> PathBuf {
+    #[cfg(test)]
+    if let Some(home) = TEST_HOME.with(|home| home.borrow().clone()) {
+        return home;
+    }
+    user_home()
+}
+#[cfg(unix)]
+fn user_home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").expect("HOME is required")).join(DATA_DIR)
 }
 #[cfg(windows)]
-pub fn home() -> PathBuf {
+fn user_home() -> PathBuf {
     PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA is required"))
         .join("FlowBar")
 }
@@ -808,6 +825,12 @@ pub fn copy_providers(yaml: &str, source: &Path, destination: &Path) -> Result<(
     }
     Ok(())
 }
+/// Saves a profile's YAML, which the caller has checked, as the named profile's copy.
+pub fn store_profile(name: &str, yaml: &str) -> Result<()> {
+    private_dir(&home())?;
+    private_dir(&profiles_dir())?;
+    private_write(&profile_path(name), yaml.as_bytes())
+}
 pub fn import_profile(source: &Path, name: Option<&str>) -> Result<Settings> {
     // A bare relative file name has an empty parent, which breaks provider lookup.
     let source = &std::path::absolute(source).context("配置文件路径无效")?;
@@ -829,8 +852,9 @@ pub fn import_profile(source: &Path, name: Option<&str>) -> Result<Settings> {
             .map(str::to_owned)
             .unwrap_or_else(|| source.file_stem().unwrap().to_string_lossy().into()),
     );
-    private_dir(&profiles_dir())?;
-    private_write(&profile_path(&name), yaml.as_bytes())?;
+    store_profile(&name, &yaml)?;
+    // A local file replaces the profile's content, so its subscription would overwrite it.
+    settings.subscriptions.remove(&name);
     settings.switch_profile(&name);
     // The new copy may have renamed its groups and nodes.
     settings.selections.clear();

@@ -125,7 +125,7 @@ define_class!(
         #[unsafe(method(toggleConnection:))]
         fn connection_button(&self, _sender: &AnyObject) { self.perform(Action::Connect); }
         #[unsafe(method(importYaml:))]
-        fn import_button(&self, _sender: &AnyObject) { self.perform(Action::Import); }
+        fn import_button(&self, _sender: &AnyObject) { self.perform(Action::ImportChoice); }
         #[unsafe(method(profileChosen:))]
         fn profile_list(&self, sender: &NSPopUpButton) {
             if let Some(name) = sender.titleOfSelectedItem() { self.perform(Action::Profile(name.to_string())); }
@@ -554,6 +554,31 @@ impl Shell for Delegate {
             .and_then(|url| url.path())
             .map(|path| PathBuf::from(path.to_string()))
     }
+    fn ask_text(&self, title: &str, message: &str, placeholder: &str) -> Option<String> {
+        let mtm = self.mtm();
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(&NSString::from_str(message));
+        alert.addButtonWithTitle(&NSString::from_str("导入"));
+        alert.addButtonWithTitle(&NSString::from_str("取消"));
+        let field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 24.0)),
+        );
+        field.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+        // A long link scrolls within one line instead of wrapping.
+        if let Some(cell) = field.cell() {
+            cell.setUsesSingleLineMode(true);
+            cell.setWraps(false);
+            cell.setScrollable(true);
+        }
+        let accessory: &NSView = &field;
+        alert.setAccessoryView(Some(accessory));
+        alert.window().setInitialFirstResponder(Some(accessory));
+        (alert.runModal() == NSAlertFirstButtonReturn).then(|| field.stringValue().to_string())
+    }
     fn alert(&self, title: &str, message: &str, buttons: &[&str]) -> usize {
         // Results of background work can arrive while another app is in front.
         #[allow(deprecated)]
@@ -838,7 +863,7 @@ impl Delegate {
         }
         view.addSubview(&profiles);
         let import = add(self.button(
-            "导入 YAML…",
+            "导入配置…",
             sel!(importYaml:),
             rect(204.0, 44.0, 108.0, 32.0),
             false,

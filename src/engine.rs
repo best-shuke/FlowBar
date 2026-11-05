@@ -41,6 +41,7 @@ pub enum Event {
     ),
     Error(String),
     Update(update::Event),
+    Subscription(crate::subscription::Event),
 }
 pub type Emit = Arc<dyn Fn(Event) + Send + Sync>;
 pub struct Run {

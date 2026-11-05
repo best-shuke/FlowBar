@@ -9,6 +9,7 @@ mod logging;
 #[cfg(target_os = "macos")]
 mod privileged;
 mod process;
+mod subscription;
 mod supervisor;
 mod ui;
 mod update;

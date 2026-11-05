@@ -40,9 +40,9 @@ use windows_sys::Win32::{
                 GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
                 OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
             },
-            EM_SETLIMITTEXT, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
-            TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TDCBF_OK_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
-            TDN_CREATED,
+            EM_SETCUEBANNER, EM_SETLIMITTEXT, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
+            InitCommonControlsEx, TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TDCBF_OK_BUTTON,
+            TDF_ALLOW_DIALOG_CANCELLATION, TDN_CREATED,
         },
         HiDpi::{
             AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem,
@@ -57,26 +57,28 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             AllowSetForegroundWindow, AppendMenuW, BM_GETCHECK, BM_SETCHECK, BN_CLICKED,
-            BS_AUTOCHECKBOX, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT,
-            CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, CW_USEDEFAULT, CreateIconIndirect,
-            CreatePopupMenu, CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyIcon, DestroyMenu,
-            DestroyWindow, DispatchMessageW, EN_KILLFOCUS, ES_AUTOHSCROLL, ES_NUMBER, FindWindowW,
-            GetDlgCtrlID, GetDlgItem, GetMenuItemCount, GetMenuStringW, GetMessageW, GetSubMenu,
-            GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+            BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL,
+            CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, CW_USEDEFAULT,
+            CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DLGTEMPLATE, DS_CENTER,
+            DS_MODALFRAME, DS_SETFONT, DefWindowProcW, DeleteMenu, DestroyIcon, DestroyMenu,
+            DestroyWindow, DialogBoxIndirectParamW, DispatchMessageW, EN_KILLFOCUS, ES_AUTOHSCROLL,
+            ES_NUMBER, EndDialog, FindWindowW, GWLP_USERDATA, GetDlgCtrlID, GetDlgItem,
+            GetMenuItemCount, GetMenuStringW, GetMessageW, GetSubMenu, GetSystemMetrics,
+            GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
             HICON, HMENU, ICONINFO, IDC_ARROW, IDCANCEL, IDOK, IMAGE_ICON, IsDialogMessageW,
             IsIconic, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MB_OK, MB_OKCANCEL,
             MB_SETFOREGROUND, MF_BYPOSITION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
             MF_STRING, MSG, MessageBoxW, MoveWindow, NONCLIENTMETRICSW, PostMessageW,
             PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SM_CXICON, SM_CXSMICON,
             SPI_GETNONCLIENTMETRICS, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE,
-            SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos,
-            SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
-            TranslateMessage, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
-            WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND,
-            WM_INITMENUPOPUP, WM_NCDESTROY, WM_NULL, WM_PAINT, WM_PRINTCLIENT, WM_SETFONT,
-            WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
-            WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
-            WS_VSCROLL,
+            SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+            SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+            TrackPopupMenuEx, TranslateMessage, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_COMMAND,
+            WM_CONTEXTMENU, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ENDSESSION,
+            WM_ERASEBKGND, WM_INITDIALOG, WM_INITMENUPOPUP, WM_NCDESTROY, WM_NULL, WM_PAINT,
+            WM_PRINTCLIENT, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD,
+            WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU,
+            WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
         },
     },
 };
@@ -167,7 +169,7 @@ const fn control(id: i32, kind: Kind, text: &'static str, rect: [i32; 4], card: 
 const CONTROLS: &[Control] = &[
     control(LABELS, Kind::Caption, "配置", [34, 16, 200, 16], false),
     control(PROFILE, Kind::Choice, "", [34, 47, 148, 200], true),
-    control(IMPORT, Kind::Button, "导入 YAML…", [186, 45, 106, 28], true),
+    control(IMPORT, Kind::Button, "导入配置…", [186, 45, 106, 28], true),
     control(
         REVEAL,
         Kind::Button,
@@ -455,6 +457,23 @@ impl Shell for Win {
         }
         let length = buffer.iter().position(|&c| c == 0).unwrap_or(0);
         Some(PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
+    }
+    fn ask_text(&self, title: &str, message: &str, placeholder: &str) -> Option<String> {
+        let mut prompt = Prompt {
+            placeholder: wide(placeholder),
+            result: None,
+        };
+        let template = prompt_template(title, message);
+        unsafe {
+            DialogBoxIndirectParamW(
+                self.instance,
+                template.as_ptr().cast::<DLGTEMPLATE>(),
+                self.owner(),
+                Some(prompt_proc),
+                (&raw mut prompt) as LPARAM,
+            )
+        };
+        prompt.result
     }
     fn alert(&self, title: &str, message: &str, buttons: &[&str]) -> usize {
         let owner = self.owner();
@@ -914,7 +933,7 @@ impl Win {
                     self.perform(Action::Profile(name));
                 }
             }
-            (IMPORT, BN_CLICKED) => self.perform(Action::Import),
+            (IMPORT, BN_CLICKED) => self.perform(Action::ImportChoice),
             (REVEAL, BN_CLICKED) => self.perform(Action::Reveal),
             (TUN | AUTO | AUTO_UPDATE, BN_CLICKED) => self.app.commit(self),
             (LOGIN, BN_CLICKED) => self.perform(Action::Login),
@@ -1209,6 +1228,127 @@ fn task_dialog() -> Option<TaskDialogIndirect> {
         >(address))
     }
 }
+/// The text prompt's state, shared with its dialog procedure for the dialog's lifetime.
+struct Prompt {
+    placeholder: Vec<u16>,
+    result: Option<String>,
+}
+const PROMPT_EDIT: i32 = 1001;
+/// An in-memory dialog template: a title, a wrapped message, an edit field and two buttons.
+/// Dialog units scale with the font and, for per-monitor aware processes, with the DPI.
+fn prompt_template(title: &str, message: &str) -> Vec<u32> {
+    const BUTTON: u16 = 0x0080;
+    const EDIT: u16 = 0x0081;
+    const STATIC: u16 = 0x0082;
+    let mut words: Vec<u16> = vec![];
+    let dword = |words: &mut Vec<u16>, value: u32| {
+        words.extend([value as u16, (value >> 16) as u16]);
+    };
+    let string = |words: &mut Vec<u16>, text: &str| {
+        words.extend(text.encode_utf16().chain([0]));
+    };
+    let style =
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | (DS_SETFONT | DS_MODALFRAME | DS_CENTER) as u32;
+    dword(&mut words, style);
+    dword(&mut words, 0);
+    let items: [(u32, [i16; 4], i32, u16, &str); 5] = [
+        (SS_NOPREFIX, [10, 8, 240, 10], -1, STATIC, title),
+        (SS_NOPREFIX, [10, 22, 240, 26], -1, STATIC, message),
+        (
+            WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+            [10, 52, 240, 13],
+            PROMPT_EDIT,
+            EDIT,
+            "",
+        ),
+        (
+            WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+            [146, 74, 50, 14],
+            IDOK,
+            BUTTON,
+            "导入",
+        ),
+        (
+            WS_TABSTOP | BS_PUSHBUTTON as u32,
+            [200, 74, 50, 14],
+            IDCANCEL,
+            BUTTON,
+            "取消",
+        ),
+    ];
+    words.push(items.len() as u16);
+    words.extend([0, 0, 260, 96].map(|v: i16| v as u16));
+    // No menu, the default dialog class, the caption, then the font.
+    words.extend([0, 0]);
+    string(&mut words, "FlowBar");
+    words.push(9);
+    string(&mut words, "Segoe UI");
+    for (style, [x, y, cx, cy], id, class, text) in items {
+        // Each item starts on a DWORD boundary.
+        if words.len() % 2 == 1 {
+            words.push(0);
+        }
+        dword(&mut words, WS_CHILD | WS_VISIBLE | style);
+        dword(&mut words, 0);
+        words.extend([x, y, cx, cy].map(|v| v as u16));
+        words.push(id as u16);
+        words.extend([0xFFFF, class]);
+        string(&mut words, text);
+        words.push(0);
+    }
+    if words.len() % 2 == 1 {
+        words.push(0);
+    }
+    words
+        .chunks(2)
+        .map(|pair| u32::from(pair[0]) | (u32::from(pair[1]) << 16))
+        .collect()
+}
+unsafe extern "system" fn prompt_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    match message {
+        WM_INITDIALOG => {
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, lparam) };
+            let prompt = unsafe { &*(lparam as *const Prompt) };
+            let edit = unsafe { GetDlgItem(hwnd, PROMPT_EDIT) };
+            unsafe {
+                SendMessageW(edit, EM_SETLIMITTEXT, 4096, 0);
+                // The cue banner needs common controls 6, which the manifest selects.
+                SendMessageW(
+                    edit,
+                    EM_SETCUEBANNER,
+                    1,
+                    prompt.placeholder.as_ptr() as LPARAM,
+                );
+                // The tray menu may have opened this while another app was in front.
+                SetForegroundWindow(hwnd);
+                SetFocus(edit);
+            }
+            // FALSE: the focus is already set.
+            0
+        }
+        WM_COMMAND => {
+            let id = (wparam & 0xFFFF) as i32;
+            if id != IDOK && id != IDCANCEL {
+                return 0;
+            }
+            if id == IDOK {
+                let prompt = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Prompt;
+                if let Some(prompt) = unsafe { prompt.as_mut() } {
+                    prompt.result = Some(text(unsafe { GetDlgItem(hwnd, PROMPT_EDIT) }));
+                }
+            }
+            unsafe { EndDialog(hwnd, id as isize) };
+            1
+        }
+        _ => 0,
+    }
+}
+
 unsafe extern "system" fn bring_to_front(
     hwnd: HWND,
     notification: u32,
