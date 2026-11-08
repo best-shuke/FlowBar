@@ -4,14 +4,16 @@
 # Usage: fetch-geo.sh <output directory>
 set -euo pipefail
 output=$1
-release=https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest
 python="$(command -v python3 || command -v python)"
+asset="$(dirname "$0")/github-asset.sh"
 mkdir -p "$output"
 # The release's file name, then the name FlowBar copies into the core's data directory.
 for pair in geoip.metadb:geoip.metadb geosite.dat:GeoSite.dat; do
     remote=${pair%%:*} name=${pair#*:}
-    curl -fsSL --retry 3 -o "$output/$name" "$release/$remote"
-    expected="$(curl -fsSL --retry 3 "$release/$remote.sha256sum")"
+    "$asset" MetaCubeX/meta-rules-dat latest "$remote" "$output/$name"
+    "$asset" MetaCubeX/meta-rules-dat latest "$remote.sha256sum" "$output/.$name.sha256sum"
+    expected="$(cat "$output/.$name.sha256sum")"
+    rm "$output/.$name.sha256sum"
     "$python" - "$output/$name" "${expected%% *}" <<'EOF'
 import hashlib, sys
 path, expected = sys.argv[1:]

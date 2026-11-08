@@ -88,12 +88,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev xvfb dbus python3-gi
 
+      # The token only lifts the API rate limit when a release download falls back to it.
       - name: Fetch mihomo
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$(dirname "$CORE")"
           ./scripts/fetch-mihomo.sh "$MIHOMO_VERSION" ${{ matrix.core }} ${{ matrix.sha256 }} "$CORE"
 
       - name: Fetch Geo databases
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./scripts/fetch-geo.sh "$RUNNER_TEMP/geo"
 
       # scripts/licenses.py reads the locked dependency sources offline.

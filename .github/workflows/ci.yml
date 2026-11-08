@@ -50,7 +50,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev xvfb dbus python3-gi
 
+      # The token only lifts the API rate limit when a release download falls back to it.
       - name: Fetch mihomo
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$(dirname "$CORE")"
           ./scripts/fetch-mihomo.sh "$MIHOMO_VERSION" ${{ matrix.core }} ${{ matrix.sha256 }} "$CORE"
@@ -64,10 +67,14 @@ jobs:
       - name: Test
         run: cargo test --locked -- --test-threads=1
 
+      - name: Fetch Geo databases
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./scripts/fetch-geo.sh "$RUNNER_TEMP/geo"
+
       - name: Package
         id: package
         run: |
-          ./scripts/fetch-geo.sh "$RUNNER_TEMP/geo"
           case ${{ matrix.system }} in
             macos) ./scripts/build.sh "$CORE" "$RUNNER_TEMP/geo" ;;
             linux) ./scripts/build-linux.sh "$CORE" "$RUNNER_TEMP/geo" ;;

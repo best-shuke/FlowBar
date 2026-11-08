@@ -8,8 +8,8 @@ case $platform in
     *) extension=gz ;;
 esac
 archive="$(mktemp -d)/mihomo.$extension"
-curl -fsSL -o "$archive" \
-    "https://github.com/MetaCubeX/mihomo/releases/download/$version/mihomo-$platform-$version.$extension"
+"$(dirname "$0")/github-asset.sh" MetaCubeX/mihomo "$version" \
+    "mihomo-$platform-$version.$extension" "$archive"
 python="$(command -v python3 || command -v python)"
 "$python" - "$archive" "$expected" "$output" <<'EOF'
 import gzip, hashlib, shutil, sys, zipfile
