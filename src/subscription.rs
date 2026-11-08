@@ -49,8 +49,11 @@ impl Subscription {
             self.interval
                 .clamp(*INTERVAL_RANGE.start(), *INTERVAL_RANGE.end()),
         );
-        now >= self.updated.saturating_add(interval * 3600)
-            && now >= self.failed.saturating_add(RETRY_AFTER.as_secs())
+        // A time after now was recorded while the clock ran ahead; it would hold back
+        // updates until the clock caught up.
+        let past = |time: u64| if time > now { 0 } else { time };
+        now >= past(self.updated).saturating_add(interval * 3600)
+            && now >= past(self.failed).saturating_add(RETRY_AFTER.as_secs())
     }
     /// Records a check that reached the server.
     pub fn checked(&mut self, download: &Download, now: u64) {
@@ -465,6 +468,12 @@ mod tests {
             (6, 0, 2_000_000)
         );
         assert_eq!(ago(100, 100 + 7200), "2 小时前");
+        // Times recorded while the clock ran ahead do not hold back updates.
+        subscription.updated = 9_000_000;
+        assert!(subscription.due(2_000_000 + 60));
+        subscription.updated = 2_000_000;
+        subscription.failed = 9_000_000;
+        assert!(subscription.due(2_000_000 + 6 * 3600));
     }
 
     /// Fetches a real subscription: FLOWBAR_TEST_SUBSCRIPTION=https://… cargo test -- --ignored

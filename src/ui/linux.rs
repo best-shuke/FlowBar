@@ -407,6 +407,18 @@ impl Linux {
         }
     }
     fn setup(&self) {
+        // Logging out, the install script's pkill and Ctrl+C quit like the menu does, so the
+        // connection stops and the tray icon leaves at once instead of after the supervisor
+        // notices that FlowBar is gone.
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            glib::unix_signal_add_local(signal, || {
+                with_shell(|shell| shell.quit());
+                // An open dialog runs its own loop, which keeps the application running until
+                // it closes. The connection has stopped already, so leave without waiting.
+                glib::timeout_add_local_once(Duration::from_secs(1), || std::process::exit(0));
+                glib::ControlFlow::Break
+            });
+        }
         let provider = gtk::CssProvider::new();
         provider.load_from_data(CSS);
         if let Some(display) = gdk::Display::default() {

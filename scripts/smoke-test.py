@@ -82,6 +82,26 @@ def launch(config, directory, log):
     process.wait(timeout=8)
     raise RuntimeError('mihomo did not become ready')
 
+def first_request(url):
+    """The first request through a new core, which must pass. mihomo answers its controller
+    before it binds the proxy port, and closes proxied connections (HTTP 502) until it has
+    finished loading the config."""
+    deadline = time.time() + 10
+    while True:
+        conn = http.client.HTTPConnection('127.0.0.1', PROXY_PORT, timeout=3)
+        try:
+            conn.request('GET', url)
+            response = conn.getresponse()
+            payload = response.read()
+            if response.status != 502 or time.time() > deadline:
+                return response.status, payload
+        except ConnectionRefusedError:
+            if time.time() > deadline:
+                raise
+        finally:
+            conn.close()
+        time.sleep(.1)
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -174,11 +194,7 @@ rules:
     with (temp / 'loopback-core.log').open('wb') as log:
         process = launch(runtime, temp, log)
         try:
-            conn = http.client.HTTPConnection('127.0.0.1', PROXY_PORT, timeout=3)
-            conn.request('GET', f'http://127.0.0.1:{server.server_port}/probe')
-            response = conn.getresponse()
-            assert response.status == 200 and response.read() == b'flowbar-direct-ok'
-            conn.close()
+            assert first_request(f'http://127.0.0.1:{server.server_port}/probe') == (200, b'flowbar-direct-ok')
             conn = http.client.HTTPConnection('127.0.0.1', PROXY_PORT, timeout=3)
             conn.request('GET', 'http://blocked.flowbar.invalid/')
             try:
@@ -216,6 +232,7 @@ rules: ['IP-CIDR,127.0.0.1/32,deleted-node,no-resolve', 'MATCH,DIRECT']
         process = launch(runtime, temp, log)
         try:
             assert api('/configs')[1]['tun']['enable'] is False
+            assert first_request(f'http://127.0.0.1:{endpoint.server_port}/probe') == (200, b'flowbar-direct-ok')
             for server, allowed in [(endpoint, True), (unrelated, False)]:
                 conn = http.client.HTTPConnection('127.0.0.1', PROXY_PORT, timeout=3)
                 conn.request('GET', f'http://127.0.0.1:{server.server_port}/probe')

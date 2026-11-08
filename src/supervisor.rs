@@ -496,6 +496,18 @@ fn run_core(
         .context("控制密钥缺失")?
         .to_owned();
     let api = Api { port, secret };
+    // mihomo serves its controller before it binds the proxy port, so a core that answers
+    // the controller may still refuse the first connections through it.
+    let mixed = parsed["mixed-port"]
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port > 0)
+        .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    let listening = || {
+        mixed.is_none_or(|address| {
+            std::net::TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok()
+        })
+    };
     // The root core keeps root's home; every other core gets its own data directory.
     #[cfg(unix)]
     let home = if tun { Path::new(ROOT_HOME) } else { cache };
@@ -530,7 +542,7 @@ fn run_core(
                         && process::alive(parent),
                     "连接已取消"
                 );
-                if api.request("GET", "/version", None).is_ok() {
+                if api.request("GET", "/version", None).is_ok() && listening() {
                     ready = true;
                     break;
                 }

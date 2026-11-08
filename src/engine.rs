@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread,
@@ -52,6 +52,8 @@ pub struct Run {
     pub status_path: PathBuf,
     pub cancelled: AtomicBool,
     pub(crate) command_pid: AtomicU32,
+    /// The groups of the profile copy this connection loaded, in profile order.
+    order: OnceLock<Vec<String>>,
 }
 impl Run {
     pub fn diagnostic(&self, message: impl AsRef<str>) {
@@ -93,12 +95,18 @@ impl Run {
                 || (cfg!(unix) && status.core_pid.is_some_and(|pid| !process::alive(pid)))
         })
     }
+    /// Read once per connection: parsing a large profile on every menu refresh is slow, and
+    /// a subscription update may have replaced the file the core is still running.
     pub fn group_order(&self) -> Vec<String> {
-        fs::read_to_string(config::profile_path(&self.settings.profile_name))
-            .ok()
-            .and_then(|y| config::summary(&y).ok())
-            .map(|s| s.groups)
-            .unwrap_or_default()
+        self.order
+            .get_or_init(|| {
+                fs::read_to_string(config::profile_path(&self.settings.profile_name))
+                    .ok()
+                    .and_then(|y| config::summary(&y).ok())
+                    .map(|s| s.groups)
+                    .unwrap_or_default()
+            })
+            .clone()
     }
 }
 pub fn start(settings: Settings, emit: Emit) -> Result<Arc<Run>> {
@@ -127,6 +135,7 @@ pub fn start(settings: Settings, emit: Emit) -> Result<Arc<Run>> {
         status_path,
         cancelled: AtomicBool::new(false),
         command_pid: AtomicU32::new(0),
+        order: OnceLock::new(),
     });
     run.diagnostic(format!("session={} FlowBar={} os={} arch={} tun={} ipv6={} mode={} proxy_port={} controller_port={} dns_port={}", run.id, env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH, run.settings.tun, run.settings.ipv6, run.settings.mode, run.settings.proxy_port, run.settings.controller_port, run.settings.dns_port));
     let background = run.clone();
@@ -198,6 +207,9 @@ fn worker(run: &Run, emit: &Emit) -> Result<()> {
         yaml: runtime,
         notes,
     } = config::render(&yaml, &run.settings, &run.api.secret)?;
+    let _ = run
+        .order
+        .set(config::summary(&yaml).map(|s| s.groups).unwrap_or_default());
     for note in &notes {
         run.diagnostic(format!("profile repaired: {note}"));
     }
@@ -654,6 +666,7 @@ mod validation_tests {
             status_path: session.path().into(),
             cancelled: AtomicBool::new(false),
             command_pid: AtomicU32::new(0),
+            order: OnceLock::new(),
         };
         assert!(!run.core_ended());
         let parent = std::process::id();

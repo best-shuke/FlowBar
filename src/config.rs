@@ -88,10 +88,16 @@ impl Default for Settings {
 }
 impl Settings {
     pub fn load() -> Self {
-        let mut settings = fs::read(home().join("settings.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let path = home().join("settings.json");
+        let mut settings = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                // The next save would replace a damaged file, and with it every subscription
+                // link and node choice; keep it for the user to recover them.
+                let _ = fs::rename(&path, home().join("settings.damaged.json"));
+                Settings::default()
+            }),
+            Err(_) => Settings::default(),
+        };
         migrate_profile(&mut settings);
         settings
     }
@@ -175,9 +181,13 @@ fn list_profiles(directory: &Path) -> Vec<String> {
     names.sort();
     names
 }
-/// A profile name that is also a file name on every system.
+/// A profile name that is also a file name: no path separators or characters Windows
+/// forbids, on Windows no device name such as `CON` or `nul.backup`, and short enough for
+/// the file name limit once `.yaml` is added.
 pub fn profile_name(name: &str) -> String {
-    let name: String = name
+    /// Bytes, below the 255 that file systems allow for one name.
+    const MAX_BYTES: usize = 200;
+    let mut name: String = name
         .trim()
         .chars()
         .map(|c| {
@@ -188,11 +198,38 @@ pub fn profile_name(name: &str) -> String {
             }
         })
         .collect();
+    if name.len() > MAX_BYTES {
+        let mut end = MAX_BYTES;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+        name.truncate(name.trim_end().len());
+    }
+    // Windows reads the part before the first dot as a device name, ignoring trailing spaces.
+    let device = name.split('.').next().unwrap_or_default().trim_end();
+    let reserved = cfg!(windows) && device_name(device);
+    if reserved {
+        name.insert(device.len(), '_');
+    }
     if name.is_empty() {
         "配置".into()
     } else {
         name
     }
+}
+/// Names Windows reserves for devices, in any case.
+fn device_name(name: &str) -> bool {
+    ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|d| name.eq_ignore_ascii_case(d))
+        || name.len() == 4
+            && name.as_bytes()[3].is_ascii_digit()
+            && name.get(..3).is_some_and(|prefix| {
+                ["COM", "LPT"]
+                    .iter()
+                    .any(|d| prefix.eq_ignore_ascii_case(d))
+            })
 }
 /// FlowBar 0.5 and earlier kept a single imported profile.yaml; it becomes the active
 /// profile in the profiles directory.
@@ -730,7 +767,12 @@ fn bypass_proxy_servers(map: &mut Mapping) {
             // Hysteria port hopping overrides `port`. DST-PORT uses `/` between
             // ranges, whereas the outbound's `ports` field uses commas.
             let ports = name_of(proxy.get("ports").unwrap_or(&proxy["port"]))?;
-            let ports = ports.replace(',', "/");
+            // Profiles often write `ports: 443, 8443-8450`.
+            let ports: String = ports
+                .replace(',', "/")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
             let valid = ports.split('/').all(|range| {
                 let mut bounds = range.split('-');
                 let port = |s: &str| s.parse::<u16>().ok().filter(|p| *p > 0);
@@ -1092,7 +1134,7 @@ mod tests {
     }
     #[test]
     fn tun_sends_proxy_servers_direct_and_follows_the_live_interface() {
-        let yaml = "interface-name: en0\nlog-level: warning\nproxies:\n  - {name: a, type: ss, server: a.example.com, port: 443}\n  - {name: b, type: ss, server: 203.0.113.7, port: 443}\n  - {name: c, type: ss, server: '2001:db8::1', port: 443}\n  - {name: d, type: ss, server: A.example.com, port: 443}\n  - {name: e, type: ss, server: inner.example.com, port: 443, dialer-proxy: a}\n  - {name: hop, type: hysteria2, server: 203.0.113.7, port: 443, ports: '8443,9000-9010'}\n  - {name: bad, type: ss, server: invalid.example.com, port: 0}\nrules: ['MATCH,a']\n";
+        let yaml = "interface-name: en0\nlog-level: warning\nproxies:\n  - {name: a, type: ss, server: a.example.com, port: 443}\n  - {name: b, type: ss, server: 203.0.113.7, port: 443}\n  - {name: c, type: ss, server: '2001:db8::1', port: 443}\n  - {name: d, type: ss, server: A.example.com, port: 443}\n  - {name: e, type: ss, server: inner.example.com, port: 443, dialer-proxy: a}\n  - {name: hop, type: hysteria2, server: 203.0.113.7, port: 443, ports: '8443, 9000-9010'}\n  - {name: bad, type: ss, server: invalid.example.com, port: 0}\nrules: ['MATCH,a']\n";
         let root = parse(&runtime(yaml, &Settings::default(), "secret").unwrap()).unwrap();
         let rules: Vec<_> = root["rules"]
             .as_sequence()
@@ -1188,6 +1230,24 @@ mod tests {
         assert!(settings.tun);
     }
     #[test]
+    fn damaged_settings_are_kept_aside_instead_of_overwritten() {
+        let temporary = tempfile::tempdir().unwrap();
+        TEST_HOME.with(|home| *home.borrow_mut() = Some(temporary.path().into()));
+        let damaged = r#"{"profileName":"x","subscriptions":{"x":{"url":"https://a"#;
+        fs::write(temporary.path().join("settings.json"), damaged).unwrap();
+        let settings = Settings::load();
+        assert_eq!(settings.profile_name, Settings::default().profile_name);
+        settings.save().unwrap();
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("settings.damaged.json")).unwrap(),
+            damaged
+        );
+        // A readable file loads as before.
+        assert_eq!(Settings::load().profile_name, settings.profile_name);
+        assert!(temporary.path().join("settings.damaged.json").exists());
+        TEST_HOME.with(|home| *home.borrow_mut() = None);
+    }
+    #[test]
     fn profiles_keep_their_own_node_choices() {
         let mut settings = Settings {
             profile_name: "工作".into(),
@@ -1219,6 +1279,29 @@ mod tests {
         assert_eq!(profile_name(" a/b:c\\d "), "a_b_c_d");
         assert_eq!(profile_name("  "), "配置");
         assert_eq!(profile_name("香港 · 01"), "香港 · 01");
+        // Windows device names cannot be file names, with or without an extension.
+        assert!(
+            ["CON", "nul", "com1", "LPT9", "Aux"]
+                .iter()
+                .all(|n| device_name(n))
+        );
+        assert!(
+            !["console", "com", "com10", "aé1", ""]
+                .iter()
+                .any(|n| device_name(n))
+        );
+        if cfg!(windows) {
+            assert_eq!(profile_name("CON"), "CON_");
+            assert_eq!(profile_name("nul.backup"), "nul_.backup");
+            assert_eq!(profile_name("Lpt9 .x"), "Lpt9_ .x");
+        } else {
+            assert_eq!(profile_name("CON"), "CON");
+        }
+        assert_eq!(profile_name("console.x"), "console.x");
+        // Long names are cut at a character boundary below the file name limit.
+        let long = profile_name(&"节点".repeat(100));
+        assert!(long.len() <= 200 && long.len() > 190);
+        assert!(long.chars().all(|c| c == '节' || c == '点'));
     }
     #[test]
     fn imports_provider_and_rejects_traversal_and_symlinks() {
